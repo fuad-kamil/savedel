@@ -215,10 +215,29 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
     return lp
 
 
-def get_owner(conn_id: str) -> Optional[int]:
+async def get_owner(ctx: ContextTypes.DEFAULT_TYPE, conn_id: str) -> Optional[int]:
+    """Retrieve owner user_chat_id from DB, or fetch directly from Telegram API if not cached."""
+    if not conn_id:
+        try:
+            return int(FALLBACK_OWNER) if FALLBACK_OWNER else None
+        except (ValueError, TypeError):
+            return None
+
     info = database.get_connection(conn_id)
-    if info:
+    if info and info.get("user_chat_id"):
         return info["user_chat_id"]
+
+    try:
+        conn = await ctx.bot.get_business_connection(conn_id)
+        if conn and conn.user_chat_id:
+            database.save_or_update_connection(
+                conn_id, conn.user.id, conn.user_chat_id, conn.is_enabled
+            )
+            logger.info(f"[CONN AUTO-RECOVER] id={conn_id} owner={conn.user_chat_id}")
+            return conn.user_chat_id
+    except Exception as e:
+        logger.warning(f"Could not fetch business connection {conn_id}: {e}")
+
     try:
         return int(FALLBACK_OWNER) if FALLBACK_OWNER else None
     except (ValueError, TypeError):
@@ -266,15 +285,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await cache_msg(ctx, msg, conn, cid, mid, date)
 
     # 2. Timed / View-Once interception
-    #
-    #  HOW IT WORKS:
-    #  - Someone sends you a view-once photo/video (the timer icon in Telegram).
-    #  - YOU swipe-right on that message and reply (even just type "." and send).
-    #  - Telegram puts the original timed message in msg.reply_to_message
-    #    WITH the real file_id — the business bot can access it!
-    #  - The bot downloads the file immediately before the timer can destroy it
-    #    and forwards it to you in your private bot chat.
-    #
     for replied in (msg.reply_to_message, msg.external_reply):
         if not replied:
             continue
@@ -312,19 +322,34 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             caption=rcap, created_at=rdate, local_path=rpath,
         )
 
-        oid = get_owner(conn)
+        oid = await get_owner(ctx, conn)
         if not oid:
+            logger.warning(f"[TIMED] No owner resolved for conn={conn}")
             continue
 
         cname = msg.chat.title or msg.chat.first_name or str(cid)
-        header = (
-            f"<b>Timed / View-Once Media Captured!</b>\n\n"
-            f"From: {esc(rname)}\n"
-            f"Chat: {esc(cname)}\n"
-            f"<i>Saved before it expires!</i>"
-        )
-        body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
-        await send_owner(ctx, oid, rtype, rpath, rfid, header, body)
+        if rpath and os.path.exists(rpath):
+            header = (
+                f"<b>⏱️ Timed / View-Once Media Captured!</b>\n\n"
+                f"From: {esc(rname)}\n"
+                f"Chat: {esc(cname)}\n"
+                f"<i>Saved before it expires!</i>"
+            )
+            body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
+            await send_owner(ctx, oid, rtype, rpath, rfid, header, body)
+        else:
+            body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
+            await ctx.bot.send_message(
+                chat_id=oid,
+                parse_mode=ParseMode.HTML,
+                text=(
+                    f"<b>⏱️ Timed Media Detected!</b>\n\n"
+                    f"From: {esc(rname)}\n"
+                    f"Chat: {esc(cname)}\n"
+                    f"Type: <code>{rtype}</code>{body}\n\n"
+                    f"<i>Telegram server blocks view-once {rtype} downloads on the Bot API, but the message and caption were logged.</i>"
+                ),
+            )
 
 
 async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -334,7 +359,7 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cid, mid, conn = msg.chat.id, msg.message_id, msg.business_connection_id
     new   = msg.text or msg.caption or "[media]"
     old_d = database.record_message_edit(cid, mid, new)
-    oid   = get_owner(conn)
+    oid   = await get_owner(ctx, conn)
     if not oid:
         return
     sn  = msg.from_user.full_name if msg.from_user else "Unknown"
@@ -363,10 +388,11 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"[DELETED] chat={cid} ids={ids}")
 
     recovered = database.mark_messages_deleted(cid, ids)
-    oid = get_owner(conn)
+    oid = await get_owner(ctx, conn)
     if not oid:
         logger.warning(f"[DELETED] no owner for conn={conn}")
         return
+
 
     if not recovered:
         try:
