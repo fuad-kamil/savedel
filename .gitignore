@@ -1,0 +1,31 @@
+# Environment secrets
+.env
+
+# Bot runtime locks & databases
+.bot.lock
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+bot.log
+
+# Media downloads (ephemeral/local)
+media/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+env/
+venv/
+ENV/
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

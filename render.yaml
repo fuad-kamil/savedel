@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: telegram-anti-delete-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: BACKUP_CHANNEL_ID
+        sync: false
+      - key: CLEANUP_TEMP_MEDIA
+        value: "true"

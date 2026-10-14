@@ -1,0 +1,303 @@
+"""Database manager for saving and retrieving Telegram Business messages."""
+
+import sqlite3
+import datetime
+import os
+from typing import Optional, Dict, Any, List
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anti_delete.db")
+
+
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    """Initialize database tables for business connections and messages."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Business connection tracking
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS business_connections (
+                connection_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                user_chat_id INTEGER NOT NULL,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # Message cache
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_connection_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sender_id INTEGER,
+                sender_name TEXT,
+                sender_username TEXT,
+                text TEXT,
+                media_type TEXT,
+                media_file_id TEXT,
+                caption TEXT,
+                created_at TEXT NOT NULL,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                deleted_at TEXT,
+                local_path TEXT,
+                UNIQUE(chat_id, message_id)
+            )
+            """
+        )
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN local_path TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # Message edits tracking
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_edits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                old_text TEXT,
+                new_text TEXT,
+                edited_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # Indexes for fast lookup on message deletion and edits
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_msg ON messages(chat_id, message_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conn ON messages(business_connection_id)"
+        )
+        conn.commit()
+
+
+def save_or_update_connection(
+    connection_id: str,
+    user_id: int,
+    user_chat_id: int,
+    is_enabled: bool,
+) -> None:
+    """Save or update business connection status."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO business_connections (connection_id, user_id, user_chat_id, is_enabled, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                user_chat_id = excluded.user_chat_id,
+                is_enabled = excluded.is_enabled,
+                updated_at = excluded.updated_at
+            """,
+            (connection_id, user_id, user_chat_id, 1 if is_enabled else 0, now),
+        )
+        conn.commit()
+
+
+def get_connection(connection_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve connection details by connection_id."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM business_connections WHERE connection_id = ?",
+            (connection_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_active_connection_by_user(user_id: int) -> Optional[Dict[str, Any]]:
+    """Retrieve active connection for a given user ID."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM business_connections WHERE user_id = ? AND is_enabled = 1 ORDER BY updated_at DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def save_message(
+    business_connection_id: str,
+    chat_id: int,
+    message_id: int,
+    sender_id: Optional[int],
+    sender_name: str,
+    sender_username: Optional[str],
+    text: Optional[str],
+    media_type: Optional[str],
+    media_file_id: Optional[str],
+    caption: Optional[str],
+    created_at: str,
+    local_path: Optional[str] = None,
+) -> None:
+    """Save a business chat message to the local cache."""
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO messages (
+                business_connection_id, chat_id, message_id,
+                sender_id, sender_name, sender_username,
+                text, media_type, media_file_id, caption, created_at, is_deleted, local_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                business_connection_id,
+                chat_id,
+                message_id,
+                sender_id,
+                sender_name,
+                sender_username,
+                text,
+                media_type,
+                media_file_id,
+                caption,
+                created_at,
+                local_path,
+            ),
+        )
+        conn.commit()
+
+
+def get_message(chat_id: int, message_id: int) -> Optional[Dict[str, Any]]:
+    """Retrieve a cached message by chat_id and message_id."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def mark_messages_deleted(
+    chat_id: int,
+    message_ids: List[int],
+) -> List[Dict[str, Any]]:
+    """Mark messages as deleted and return their cached data."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    recovered_messages = []
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        for msg_id in message_ids:
+            cursor.execute(
+                "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?",
+                (chat_id, msg_id),
+            )
+            row = cursor.fetchone()
+            if row:
+                recovered_messages.append(dict(row))
+                cursor.execute(
+                    "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE chat_id = ? AND message_id = ?",
+                    (now, chat_id, msg_id),
+                )
+        conn.commit()
+
+    return recovered_messages
+
+
+def record_message_edit(
+    chat_id: int,
+    message_id: int,
+    new_text: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Record an edited message and return the previous cached version."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        )
+        old_row = cursor.fetchone()
+        old_data = dict(old_row) if old_row else None
+
+        if old_data:
+            cursor.execute(
+                """
+                INSERT INTO message_edits (chat_id, message_id, old_text, new_text, edited_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (chat_id, message_id, old_data.get("text") or old_data.get("caption"), new_text, now),
+            )
+            # Update current text in messages table
+            cursor.execute(
+                "UPDATE messages SET text = ? WHERE chat_id = ? AND message_id = ?",
+                (new_text, chat_id, message_id),
+            )
+            conn.commit()
+
+        return old_data
+
+
+def get_stats() -> Dict[str, int]:
+    """Get database statistics."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        total_messages = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE is_deleted = 1")
+        total_deleted = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM message_edits")
+        total_edits = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM business_connections WHERE is_enabled = 1")
+        active_connections = cursor.fetchone()[0]
+
+        return {
+            "total_messages": total_messages,
+            "total_deleted": total_deleted,
+            "total_edits": total_edits,
+            "active_connections": active_connections,
+        }
+
+
+def get_recent_deletions(limit: int = 5) -> List[Dict[str, Any]]:
+    """Retrieve recently deleted messages."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM messages
+            WHERE is_deleted = 1
+            ORDER BY deleted_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def get_recent_messages(limit: int = 10) -> List[Dict[str, Any]]:
+    """Retrieve most recently cached messages across all chats."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM messages
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
