@@ -206,6 +206,27 @@ async def dl(ctx: ContextTypes.DEFAULT_TYPE, file_id: str,
         return None
 
 
+async def dl_media_obj(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
+                       mtype: str, chat_id: int, msg_id: int) -> tuple[Optional[str], Optional[str]]:
+    """
+    Download media to disk. If photo has multiple resolutions, tries from highest
+    down to thumbnail in case full-resolution is restricted by Telegram server.
+    Returns (local_path, file_id).
+    """
+    if mtype == "photo" and getattr(obj, "photo", None):
+        for ps in reversed(obj.photo):
+            lp = await dl(ctx, ps.file_id, "photo", chat_id, msg_id)
+            if lp:
+                return lp, ps.file_id
+        return None, (obj.photo[-1].file_id if obj.photo else None)
+
+    _, fid = extract_media(obj)
+    if fid:
+        lp = await dl(ctx, fid, mtype, chat_id, msg_id)
+        return lp, fid
+    return None, None
+
+
 async def send_owner(ctx: ContextTypes.DEFAULT_TYPE, oid: int,
                      mtype: str, lpath: Optional[str], fid: Optional[str],
                      header: str, body: str,
@@ -390,7 +411,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         logger.info(f"  [TIMED] capturing {rtype} msg_id={rmid} from {rname}")
-        rpath = await dl(ctx, rfid, rtype, cid, rmid)
+        rpath, effective_fid = await dl_media_obj(ctx, replied, rtype, cid, rmid)
+        rfid = effective_fid or rfid
         rcurl = upload_to_cloudinary(rpath, rtype) if (rpath and rtype) else None
 
         database.save_message(
@@ -415,33 +437,81 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         runame = f"@{rs.username}" if (rs and rs.username) else "None"
         reply_markup = make_alert_block_keyboard(oid, rsid)
 
-        if rpath and os.path.exists(rpath):
-            header = (
-                f"⏱️ <b>Timed / View-Once Media Captured!</b>\n\n"
-                f"👤 <b>Sender:</b> {esc(rname)} ({esc(runame)})\n"
-                f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
-                f"💬 <b>Chat:</b> {esc(cname)}\n"
-                f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
-                f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
-                f"📦 <b>Type:</b> <code>{rtype}</code>\n"
-                f"<i>Saved before it expires!</i>"
-            )
-            body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
-            await send_owner(ctx, oid, rtype, rpath, rfid, header, body, reply_markup=reply_markup)
-        else:
-            body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
+        header = (
+            f"⏱️ <b>Timed / View-Once Media Captured!</b>\n\n"
+            f"👤 <b>Sender:</b> {esc(rname)} ({esc(runame)})\n"
+            f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
+            f"💬 <b>Chat:</b> {esc(cname)}\n"
+            f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+            f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
+            f"📦 <b>Type:</b> <code>{rtype}</code>\n"
+            f"<i>Saved before it expires!</i>"
+        )
+        body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
+
+        delivered = False
+
+        # Strategy 1: Deliver downloaded file or Cloudinary URL
+        if (rpath and os.path.exists(rpath)) or rcurl:
+            try:
+                await send_owner(ctx, oid, rtype, rpath, rfid, header, body, reply_markup=reply_markup, cloud_url=rcurl)
+                delivered = True
+                logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via file/cloud")
+            except Exception as e_send:
+                logger.warning(f"  [TIMED SEND FAIL] {e_send}")
+
+        # Strategy 2: Copy message directly from chat to owner
+        if not delivered:
+            try:
+                await ctx.bot.copy_message(
+                    chat_id=oid,
+                    from_chat_id=cid,
+                    message_id=rmid,
+                    caption=f"{header}{body}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                )
+                delivered = True
+                logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via copy_message")
+            except Exception as e_copy:
+                logger.warning(f"  [TIMED COPY FAIL] {e_copy}")
+
+        # Strategy 3: Forward original message directly to owner
+        if not delivered:
+            try:
+                await ctx.bot.forward_message(
+                    chat_id=oid,
+                    from_chat_id=cid,
+                    message_id=rmid,
+                )
+                delivered = True
+                logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via forward_message")
+            except Exception as e_fwd:
+                logger.warning(f"  [TIMED FORWARD FAIL] {e_fwd}")
+
+        # Strategy 4: Deliver directly using Telegram file_id
+        if not delivered and rfid:
+            try:
+                await send_owner(ctx, oid, rtype, None, rfid, header, body, reply_markup=reply_markup)
+                delivered = True
+                logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via Telegram file_id")
+            except Exception as e_fid:
+                logger.warning(f"  [TIMED FID FAIL] {e_fid}")
+
+        # Strategy 5: Notice alert if Telegram server prevents all automated delivery
+        if not delivered:
             await ctx.bot.send_message(
                 chat_id=oid,
                 parse_mode=ParseMode.HTML,
                 text=(
-                    f"⏱️ <b>Timed Media Detected!</b>\n\n"
+                    f"⏱️ <b>Timed Media Alert!</b>\n\n"
                     f"👤 <b>Sender:</b> {esc(rname)} ({esc(runame)})\n"
                     f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
                     f"💬 <b>Chat:</b> {esc(cname)}\n"
                     f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
                     f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
                     f"📦 <b>Type:</b> <code>{rtype}</code>{body}\n\n"
-                    f"<i>Telegram server blocks view-once {rtype} downloads on the Bot API, but the message details were logged.</i>"
+                    f"<i>Note: If media is view-once encrypted, view it in chat before expiration.</i>"
                 ),
                 reply_markup=reply_markup,
             )
