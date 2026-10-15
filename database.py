@@ -613,6 +613,7 @@ def record_user(
             ON CONFLICT(user_id) DO UPDATE SET
                 full_name = excluded.full_name,
                 username = COALESCE(excluded.username, users.username),
+                is_admin = CASE WHEN excluded.is_admin = 1 THEN 1 ELSE users.is_admin END,
                 last_seen = excluded.last_seen,
                 total_messages = users.total_messages + 1
             """,

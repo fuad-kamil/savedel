@@ -231,15 +231,14 @@ def get_admin_notification_targets() -> set[int]:
             targets.add(int(uid))
     except Exception:
         pass
-    # If no explicit admin IDs configured in .env, fall back to active connection owners
-    if not targets:
-        try:
-            for conn in database.get_active_connections():
-                uid = conn.get("user_chat_id")
-                if uid:
-                    targets.add(int(uid))
-        except Exception:
-            pass
+    # Business connection owners are primary bot administrators and must always receive alerts
+    try:
+        for conn in database.get_active_connections():
+            uid = conn.get("user_chat_id") or conn.get("user_id")
+            if uid:
+                targets.add(int(uid))
+    except Exception:
+        pass
     return targets
 
 
@@ -248,7 +247,7 @@ async def notify_admins(
     text: str,
     exclude_id: Optional[Any] = None,
 ) -> None:
-    """Deliver an operational notification to all admins and owners."""
+    """Deliver an operational notification to all admins and owners with format fallback."""
     exclude_int = None
     if exclude_id is not None:
         try:
@@ -266,8 +265,17 @@ async def notify_admins(
                 text=text,
                 parse_mode=ParseMode.HTML,
             )
-        except Exception as e:
-            logger.warning(f"[ADMIN NOTIFY FAIL] to={tid}: {e}")
+        except Exception as e_html:
+            # Fallback to plain text if Telegram fails on HTML tags
+            try:
+                import re
+                plain = re.sub(r"<[^>]+>", "", text)
+                await ctx.bot.send_message(
+                    chat_id=tid,
+                    text=plain,
+                )
+            except Exception as e_plain:
+                logger.warning(f"[ADMIN NOTIFY FAIL] to={tid}: {e_html} / {e_plain}")
 
 
 # Commands visible to all regular (non-admin) users
@@ -596,6 +604,15 @@ async def on_connection(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"[CONN NOTIFY] {e}")
 
+    conn_alert = (
+        f"🔔 <b>Admin Notification: Business Connection Changed</b>\n\n"
+        f"👤 <b>User ID:</b> <code>{c.user.id}</code>\n"
+        f"💬 <b>Chat ID:</b> <code>{c.user_chat_id}</code>\n"
+        f"⚙️ <b>Change Type:</b> 🔗 <code>{'Business Connected' if c.is_enabled else 'Business Disconnected'}</code>\n"
+        f"🕒 <b>Connection ID:</b> <code>{c.id}</code>"
+    )
+    await notify_admins(ctx, conn_alert, exclude_id=c.user_chat_id)
+
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -763,24 +780,28 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 ),
             )
 
+        # Notify other admins about timed media intercept
+        await notify_admins(ctx, f"{header}\n{body or ''}", exclude_id=oid)
+
 async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.edited_business_message
+    msg = update.edited_business_message or update.edited_message
     if not msg:
         return
-    cid, mid, conn = msg.chat.id, msg.message_id, msg.business_connection_id
-    if is_duplicate_alert(f"edit_{cid}_{mid}"):
+    cid = msg.chat.id
+    mid = msg.message_id
+    conn = getattr(msg, "business_connection_id", None) or "direct"
+    new = msg.text or msg.caption or "[media]"
+    content_hash = hash(new)
+    if is_duplicate_alert(f"edit_{cid}_{mid}_{content_hash}", cooldown_seconds=2.0):
         return
 
-    new   = msg.text or msg.caption or "[media]"
     old_d = database.record_message_edit(cid, mid, new)
-    oid   = await get_owner(ctx, conn)
-    if not oid:
-        return
-    sn   = msg.from_user.full_name if msg.from_user else "Unknown"
-    sid  = msg.from_user.id if msg.from_user else "Unknown"
-    un   = f"@{msg.from_user.username}" if (msg.from_user and msg.from_user.username) else "None"
-    cn   = msg.chat.title or msg.chat.first_name or str(cid)
-    old  = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
+    oid = await get_owner(ctx, conn) if conn and conn != "direct" else None
+    sn = msg.from_user.full_name if msg.from_user else "Unknown"
+    sid = msg.from_user.id if msg.from_user else "Unknown"
+    un = f"@{msg.from_user.username}" if (msg.from_user and msg.from_user.username) else "None"
+    cn = msg.chat.title or msg.chat.first_name or str(cid)
+    old = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
 
     admin_edit_alert = (
         f"🔔 <b>Admin Notification: Message Edited</b>\n\n"
@@ -793,10 +814,11 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
     )
 
-    try:
-        await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=admin_edit_alert)
-    except Exception as e:
-        logger.error(f"[EDIT NOTIFY] {e}")
+    if oid:
+        try:
+            await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=admin_edit_alert)
+        except Exception as e:
+            logger.error(f"[EDIT NOTIFY to owner={oid}] {e}")
 
     await notify_admins(ctx, admin_edit_alert, exclude_id=oid)
 
@@ -871,6 +893,9 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
         except Exception as e:
             logger.error(f"[RECOVERED SEND] {e}")
+
+        # Alert other admins about the deletion event
+        await notify_admins(ctx, f"{hdr}{body or ''}", exclude_id=oid)
 
 
 # ── Admin Dashboard Builders ──────────────────────────────────────────────────
@@ -1728,7 +1753,7 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         f"📝 <b>Content:</b> <blockquote>{esc(snippet)}</blockquote>\n"
         f"🕒 <b>Recorded At:</b> <code>{date[:19].replace('T', ' ')} UTC</code>"
     )
-    await notify_admins(ctx, admin_note, exclude_id=s.id if s else None)
+    await notify_admins(ctx, admin_note)
 
     reply_kb = get_reply_keyboard(admin=is_user_adm)
     if mt and lp:
@@ -1791,6 +1816,7 @@ def build_app():
     app.add_handler(BusinessConnectionHandler(on_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_message))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, on_edit))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, on_edit))
     app.add_handler(BusinessMessagesDeletedHandler(on_deleted))
 
     # 2. Direct 1-on-1 private chats with the bot itself (including forwarded media)
