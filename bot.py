@@ -121,18 +121,6 @@ def is_admin(user_id: Optional[int]) -> bool:
     return bool(conn)
 
 
-def make_alert_block_keyboard(owner_id: Optional[int], sender_id: Any) -> Optional[InlineKeyboardMarkup]:
-    """
-    Generate an inline keyboard for saved/alert messages.
-    Non-admin users will NEVER see administrative buttons like 'Block User'.
-    """
-    if not is_admin(owner_id):
-        return None
-    if not sender_id or not str(sender_id).isdigit():
-        return None
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🚫 Block User", callback_data=f"block_usr_{sender_id}")
-    ]])
 
 
 # ── Render Health Server ───────────────────────────────────────────────────────
@@ -471,7 +459,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cname = msg.chat.title or msg.chat.first_name or str(cid)
         rsid = rs.id if rs else "Unknown"
         runame = f"@{rs.username}" if (rs and rs.username) else "None"
-        reply_markup = make_alert_block_keyboard(oid, rsid)
 
         header = (
             f"⏱️ <b>Timed / View-Once Media Captured!</b>\n\n"
@@ -490,7 +477,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Strategy 1: Deliver downloaded file or Cloudinary URL
         if (rpath and os.path.exists(rpath)) or rcurl:
             try:
-                await send_owner(ctx, oid, rtype, rpath, rfid, header, body, reply_markup=reply_markup, cloud_url=rcurl)
+                await send_owner(ctx, oid, rtype, rpath, rfid, header, body, cloud_url=rcurl)
                 delivered = True
                 logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via file/cloud")
             except Exception as e_send:
@@ -505,7 +492,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     message_id=rmid,
                     caption=f"{header}{body}",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
                 )
                 delivered = True
                 logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via copy_message")
@@ -528,7 +514,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Strategy 4: Deliver directly using Telegram file_id
         if not delivered and rfid:
             try:
-                await send_owner(ctx, oid, rtype, None, rfid, header, body, reply_markup=reply_markup)
+                await send_owner(ctx, oid, rtype, None, rfid, header, body)
                 delivered = True
                 logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via Telegram file_id")
             except Exception as e_fid:
@@ -569,8 +555,6 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cn   = msg.chat.title or msg.chat.first_name or str(cid)
     old  = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
 
-    reply_markup = make_alert_block_keyboard(oid, sid)
-
     try:
         await ctx.bot.send_message(
             chat_id=oid, parse_mode=ParseMode.HTML,
@@ -584,7 +568,6 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 f"<b>Before:</b>\n<blockquote>{esc(old)}</blockquote>\n\n"
                 f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
             ),
-            reply_markup=reply_markup,
         )
     except Exception as e:
         logger.error(f"[EDIT NOTIFY] {e}")
@@ -648,17 +631,15 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         body = f"\n\n📝 <b>Content:</b>\n<blockquote>{esc(tb)}</blockquote>" if tb else ""
 
-        reply_markup = make_alert_block_keyboard(oid, sid)
         curl = item.get("cloud_url")
 
         try:
             if mt:
-                await send_owner(ctx, oid, mt, lp, fid, hdr, body, reply_markup=reply_markup, cloud_url=curl)
+                await send_owner(ctx, oid, mt, lp, fid, hdr, body, cloud_url=curl)
             else:
                 await ctx.bot.send_message(
                     chat_id=oid, parse_mode=ParseMode.HTML,
                     text=f"{hdr}{body or chr(10) + '[Empty message]'}",
-                    reply_markup=reply_markup
                 )
         except Exception as e:
             logger.error(f"[RECOVERED SEND] {e}")
@@ -915,6 +896,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     database.record_user(u.id, u.full_name or "Unknown", u.username)
 
+    if not is_admin(u.id):
+        fname = esc(u.first_name or u.full_name or "there")
+        welcome_text = (
+            f"👋 Welcome, <b>{fname}</b>!\n\n"
+            f"Glad to have you here. Have a great day!"
+        )
+        await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
+        return
+
     c = database.get_active_connection_by_user(u.id)
     s = database.get_stats()
     b = await ctx.bot.get_me()
@@ -936,10 +926,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton("📊 Status", callback_data="cmd_status_btn"),
             InlineKeyboardButton("💾 Saved Messages", callback_data="cmd_saved_btn"),
-        ]
+        ],
+        [InlineKeyboardButton("👑 Open Admin Dashboard", callback_data="adm_menu")]
     ]
-    if is_admin(u.id):
-        kb.append([InlineKeyboardButton("👑 Open Admin Dashboard", callback_data="adm_menu")])
 
     await update.message.reply_text(parse_mode=ParseMode.HTML, text=text, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -1032,6 +1021,10 @@ async def cmd_purge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
+    if not u or not is_admin(u.id):
+        fname = esc(u.first_name or u.full_name or "there") if u else "there"
+        await update.message.reply_text(f"👋 Welcome, <b>{fname}</b>!\n\nGlad to have you here. Have a great day!", parse_mode=ParseMode.HTML)
+        return
     c = database.get_active_connection_by_user(u.id) if u else None
     s = database.get_stats()
     await update.message.reply_text(parse_mode=ParseMode.HTML, text=(
@@ -1046,11 +1039,21 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        fname = esc(u.first_name or u.full_name or "there") if u else "there"
+        await update.message.reply_text(f"👋 Welcome, <b>{fname}</b>!\n\nGlad to have you here. Have a great day!", parse_mode=ParseMode.HTML)
+        return
     text, kb = render_deletions_view("all")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        fname = esc(u.first_name or u.full_name or "there") if u else "there"
+        await update.message.reply_text(f"👋 Welcome, <b>{fname}</b>!\n\nGlad to have you here. Have a great day!", parse_mode=ParseMode.HTML)
+        return
     text, kb = render_saved_view("all")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -1069,22 +1072,25 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     # User start shortcut buttons
-    if data == "cmd_status_btn":
-        s = database.get_stats()
-        await query.message.reply_text(
-            f"📊 <b>Live Status</b>\n\n"
-            f"Messages Cached: <code>{s['total_messages']}</code>\n"
-            f"Deleted Recovered: <code>{s['total_deleted']}</code>\n"
-            f"Edits Logged: <code>{s['total_edits']}</code>\n"
-            f"Tracked Users: <code>{s['total_users']}</code>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if data == "cmd_saved_btn":
-        text, kb = render_saved_view("all")
-        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        return
+    if data in ("cmd_status_btn", "cmd_saved_btn"):
+        if not is_admin(u.id):
+            await query.answer("⛔ Access denied: Admin only.", show_alert=True)
+            return
+        if data == "cmd_status_btn":
+            s = database.get_stats()
+            await query.message.reply_text(
+                f"📊 <b>Live Status</b>\n\n"
+                f"Messages Cached: <code>{s['total_messages']}</code>\n"
+                f"Deleted Recovered: <code>{s['total_deleted']}</code>\n"
+                f"Edits Logged: <code>{s['total_edits']}</code>\n"
+                f"Tracked Users: <code>{s['total_users']}</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        elif data == "cmd_saved_btn":
+            text, kb = render_saved_view("all")
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
 
     # Admin verification for all administrative actions
     if not is_admin(u.id):
