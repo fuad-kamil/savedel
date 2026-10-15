@@ -615,6 +615,127 @@ def render_blocked_view() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
+# ── Rich Media Helpers & Renderers ────────────────────────────────────────────
+MEDIA_ICONS = {
+    "photo": "📸 Photo",
+    "video": "🎥 Video",
+    "voice": "🎙️ Voice Note",
+    "video_note": "🔘 Video Note",
+    "audio": "🎵 Audio / Music",
+    "document": "📁 File / Document",
+    "animation": "🎬 GIF / Animation",
+    "sticker": "🏷️ Sticker",
+}
+
+
+def format_media_badge(mtype: Optional[str]) -> str:
+    if not mtype:
+        return "💬 Text"
+    return MEDIA_ICONS.get(mtype, f"📦 {mtype.capitalize()}")
+
+
+def render_deletions_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMarkup]:
+    items = database.get_recent_deletions(limit=6, filter_type=filter_type)
+    type_label = "📸 Media Only" if filter_type == "media" else ("💬 Text Only" if filter_type == "text" else "All Messages")
+
+    lines = [f"🗑️ <b>Recent Deletions Archive</b> ({type_label})\n"]
+    if not items:
+        lines.append(f"<i>No deleted {filter_type} messages recorded yet.</i>")
+
+    media_buttons = []
+    for i, it in enumerate(items, 1):
+        sn = esc(it.get("sender_name") or "Unknown")
+        sid = it.get("sender_id") or "N/A"
+        cid = it.get("chat_id")
+        mid = it.get("message_id")
+        db_id = it.get("id")
+        mtype = it.get("media_type")
+        mbadge = format_media_badge(mtype)
+
+        cap = it.get("caption") or it.get("text") or ""
+        if cap and len(cap) > 32:
+            cap = cap[:29] + "..."
+
+        t = (it.get("deleted_at") or "")[:19].replace("T", " ")
+
+        if mtype:
+            desc = f"<b>{mbadge}</b>" + (f': <i>"{esc(cap)}"</i>' if cap else " <i>(no caption)</i>")
+            media_buttons.append(InlineKeyboardButton(f"📥 View #{i} ({mtype})", callback_data=f"adm_getdel_{db_id}"))
+        else:
+            desc = f'💬 <b>Text:</b> <i>"{esc(cap or "[Empty]")}"</i>'
+
+        lines.append(
+            f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
+            f"   {desc}\n"
+            f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code> | 🕒 {t} UTC\n"
+        )
+
+    keyboard = []
+    for j in range(0, len(media_buttons), 2):
+        keyboard.append(media_buttons[j:j+2])
+
+    filter_row = [
+        InlineKeyboardButton("• All •" if filter_type == "all" else "All", callback_data="adm_delfilter_all"),
+        InlineKeyboardButton("• 📸 Media •" if filter_type == "media" else "📸 Media", callback_data="adm_delfilter_media"),
+        InlineKeyboardButton("• 💬 Text •" if filter_type == "text" else "💬 Text", callback_data="adm_delfilter_text"),
+    ]
+    keyboard.append(filter_row)
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+def render_saved_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMarkup]:
+    items = database.get_recent_messages(limit=6, filter_type=filter_type)
+    type_label = "📸 Media Only" if filter_type == "media" else ("💬 Text Only" if filter_type == "text" else "All Messages")
+
+    lines = [f"💾 <b>Cached Messages Archive</b> ({type_label})\n"]
+    if not items:
+        lines.append(f"<i>No cached {filter_type} messages recorded yet.</i>")
+
+    media_buttons = []
+    for i, it in enumerate(items, 1):
+        sn = esc(it.get("sender_name") or "Unknown")
+        sid = it.get("sender_id") or "N/A"
+        cid = it.get("chat_id")
+        mid = it.get("message_id")
+        db_id = it.get("id")
+        mtype = it.get("media_type")
+        mbadge = format_media_badge(mtype)
+
+        cap = it.get("caption") or it.get("text") or ""
+        if cap and len(cap) > 32:
+            cap = cap[:29] + "..."
+
+        t = (it.get("created_at") or "")[:19].replace("T", " ")
+
+        if mtype:
+            desc = f"<b>{mbadge}</b>" + (f': <i>"{esc(cap)}"</i>' if cap else " <i>(no caption)</i>")
+            media_buttons.append(InlineKeyboardButton(f"📥 View #{i} ({mtype})", callback_data=f"adm_getsaved_{db_id}"))
+        else:
+            desc = f'💬 <b>Text:</b> <i>"{esc(cap or "[Empty]")}"</i>'
+
+        lines.append(
+            f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
+            f"   {desc}\n"
+            f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code> | 🕒 {t} UTC\n"
+        )
+
+    keyboard = []
+    for j in range(0, len(media_buttons), 2):
+        keyboard.append(media_buttons[j:j+2])
+
+    filter_row = [
+        InlineKeyboardButton("• All •" if filter_type == "all" else "All", callback_data="adm_savedfilter_all"),
+        InlineKeyboardButton("• 📸 Media •" if filter_type == "media" else "📸 Media", callback_data="adm_savedfilter_media"),
+        InlineKeyboardButton("• 💬 Text •" if filter_type == "text" else "💬 Text", callback_data="adm_savedfilter_text"),
+    ]
+    keyboard.append(filter_row)
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
@@ -717,49 +838,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    items = database.get_recent_deletions(limit=5)
-    if not items:
-        await update.message.reply_text("No deleted messages recorded yet.")
-        return
-    parts = ["🗑️ <b>Recently Deleted Messages:</b>\n"]
-    for i, it in enumerate(items, 1):
-        sn  = esc(it.get("sender_name") or "Unknown")
-        sid = it.get("sender_id") or "N/A"
-        cid = it.get("chat_id")
-        mid = it.get("message_id")
-        co  = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
-        t   = (it.get("deleted_at") or "")[:19].replace("T", " ")
-        parts.append(
-            f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
-            f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
-            f"   <i>\"{co}\"</i> ({t} UTC)\n"
-        )
-    await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+    text, kb = render_deletions_view("all")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    items = database.get_recent_messages(limit=8)
-    if not items:
-        await update.message.reply_text("No cached messages found yet.")
-        return
-    parts = ["💾 <b>Saved Messages Archive:</b>\n"]
-    for i, it in enumerate(items, 1):
-        sn  = esc(it.get("sender_name") or "Unknown")
-        sid = it.get("sender_id") or "N/A"
-        cid = it.get("chat_id")
-        mid = it.get("message_id")
-        mt  = it.get("media_type")
-        txt = it.get("text") or it.get("caption") or (f"[{mt}]" if mt else "[Empty]")
-        if len(txt) > 35:
-            txt = txt[:32] + "..."
-        saved_status = " 💾" if it.get("local_path") else ""
-        t = (it.get("created_at") or "")[:19].replace("T", " ")
-        parts.append(
-            f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
-            f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
-            f"   Content: {esc(txt)}{saved_status} (<code>{t} UTC</code>)\n"
-        )
-    await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+    text, kb = render_saved_view("all")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ── Interactive Callback Handler ──────────────────────────────────────────────
@@ -789,16 +874,8 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if data == "cmd_saved_btn":
-        items = database.get_recent_messages(limit=6)
-        if not items:
-            await query.message.reply_text("No cached messages found yet.")
-            return
-        parts = ["💾 <b>Recent Messages:</b>\n"]
-        for i, it in enumerate(items, 1):
-            sn = esc(it.get("sender_name") or "Unknown")
-            co = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
-            parts.append(f"<b>{i}. {sn}:</b> {co[:30]}")
-        await query.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+        text, kb = render_saved_view("all")
+        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     # Admin verification for all administrative actions
@@ -872,52 +949,52 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")]])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    elif data == "adm_deletions":
-        items = database.get_recent_deletions(limit=6)
-        if not items:
-            text = "🗑️ <b>Recent Deletions</b>\n\n<i>No deleted messages recorded yet.</i>"
-        else:
-            parts = ["🗑️ <b>Recent Deletions:</b>\n"]
-            for i, it in enumerate(items, 1):
-                sn = esc(it.get("sender_name") or "Unknown")
-                sid = it.get("sender_id") or "N/A"
-                cid = it.get("chat_id")
-                mid = it.get("message_id")
-                co = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
-                if len(co) > 30:
-                    co = co[:27] + "..."
-                t = (it.get("deleted_at") or "")[:19].replace("T", " ")
-                parts.append(
-                    f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
-                    f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
-                    f"   <i>\"{co}\"</i> ({t} UTC)\n"
-                )
-            text = "\n".join(parts)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")]])
+    elif data.startswith("adm_delfilter_") or data == "adm_deletions":
+        ftype = data.replace("adm_delfilter_", "") if data.startswith("adm_delfilter_") else "all"
+        text, kb = render_deletions_view(ftype)
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    elif data == "adm_saved":
-        items = database.get_recent_messages(limit=6)
-        if not items:
-            text = "💾 <b>Cached Messages</b>\n\n<i>No messages cached yet.</i>"
-        else:
-            parts = ["💾 <b>Recent Cached Messages:</b>\n"]
-            for i, it in enumerate(items, 1):
-                sn = esc(it.get("sender_name") or "Unknown")
-                sid = it.get("sender_id") or "N/A"
-                cid = it.get("chat_id")
-                mid = it.get("message_id")
-                co = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
-                if len(co) > 30:
-                    co = co[:27] + "..."
-                parts.append(
-                    f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
-                    f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
-                    f"   <i>\"{co}\"</i>\n"
-                )
-            text = "\n".join(parts)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")]])
+    elif data.startswith("adm_savedfilter_") or data == "adm_saved":
+        ftype = data.replace("adm_savedfilter_", "") if data.startswith("adm_savedfilter_") else "all"
+        text, kb = render_saved_view(ftype)
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data.startswith("adm_getdel_") or data.startswith("adm_getsaved_"):
+        is_del = data.startswith("adm_getdel_")
+        prefix = "adm_getdel_" if is_del else "adm_getsaved_"
+        db_id_str = data.replace(prefix, "")
+        if db_id_str.isdigit():
+            db_id = int(db_id_str)
+            item = database.get_message_by_db_id(db_id)
+            if not item:
+                await query.answer("Message not found in database.", show_alert=True)
+                return
+            mtype = item.get("media_type")
+            lpath = item.get("local_path")
+            fid   = item.get("media_file_id")
+            if not mtype or not (fid or (lpath and os.path.exists(lpath))):
+                await query.answer("No downloadable media file available for this message.", show_alert=True)
+                return
+
+            await query.answer(f"Sending {mtype} to your chat... 🚀")
+            sn  = esc(item.get("sender_name") or "Unknown")
+            sid = item.get("sender_id") or "N/A"
+            cid = item.get("chat_id")
+            mid = item.get("message_id")
+            t   = (item.get("deleted_at" if is_del else "created_at") or "")[:19].replace("T", " ")
+            cap = item.get("caption") or item.get("text") or ""
+            mbadge = format_media_badge(mtype)
+
+            title = "🗑️ <b>Deleted Media Retrieval</b>" if is_del else "💾 <b>Saved Media Retrieval</b>"
+            hdr = (
+                f"{title}\n\n"
+                f"👤 <b>Sender:</b> {sn} (ID: <code>{sid}</code>)\n"
+                f"📦 <b>Media Type:</b> {mbadge}\n"
+                f"💬 <b>Chat:</b> <code>{cid}</code> | Msg: <code>{mid}</code>\n"
+                f"🕒 <b>Recorded At:</b> <code>{t} UTC</code>"
+            )
+            body = f"\nCaption: <blockquote>{esc(cap)}</blockquote>" if cap else ""
+            await send_owner(ctx, u.id, mtype, lpath, fid, hdr, body)
 
     elif data == "adm_close":
         try:

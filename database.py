@@ -318,35 +318,86 @@ def get_stats() -> Dict[str, int]:
         }
 
 
-def get_recent_deletions(limit: int = 5) -> List[Dict[str, Any]]:
-    """Retrieve recently deleted messages."""
+def get_recent_deletions(limit: int = 6, filter_type: str = "all") -> List[Dict[str, Any]]:
+    """Retrieve recently deleted messages with optional filter ('all', 'media', 'text')."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT * FROM messages
-            WHERE is_deleted = 1
-            ORDER BY deleted_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
+        if filter_type == "media":
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                WHERE is_deleted = 1 AND media_type IS NOT NULL AND media_type != ''
+                ORDER BY deleted_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        elif filter_type == "text":
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                WHERE is_deleted = 1 AND (media_type IS NULL OR media_type = '')
+                ORDER BY deleted_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                WHERE is_deleted = 1
+                ORDER BY deleted_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
         return [dict(r) for r in cursor.fetchall()]
 
 
-def get_recent_messages(limit: int = 10) -> List[Dict[str, Any]]:
-    """Retrieve most recently cached messages across all chats."""
+def get_recent_messages(limit: int = 6, filter_type: str = "all") -> List[Dict[str, Any]]:
+    """Retrieve most recently cached messages across all chats with optional filter ('all', 'media', 'text')."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT * FROM messages
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
+        if filter_type == "media":
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                WHERE media_type IS NOT NULL AND media_type != ''
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        elif filter_type == "text":
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                WHERE media_type IS NULL OR media_type = ''
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
         return [dict(r) for r in cursor.fetchall()]
+
+
+def get_message_by_db_id(db_id: int) -> Optional[Dict[str, Any]]:
+    """Retrieve a cached message by its primary key ID."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM messages WHERE id = ?", (db_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
 
 # ── User Management ───────────────────────────────────────────────────────────
