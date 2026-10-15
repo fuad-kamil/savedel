@@ -11,7 +11,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-import os, html, logging, atexit, threading
+import os, html, logging, atexit, threading, asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Any
 from dotenv import load_dotenv
@@ -149,6 +149,19 @@ def delete_from_cloudinary(
                 logger.warning(f"  [CLOUDINARY DESTROY FAIL] pid={pid} rtype={rtype}: {e}")
 
     return success
+
+
+async def bg_upload_to_cloudinary(local_path: Optional[str], mtype: str, chat_id: int, msg_id: int) -> None:
+    """Run Cloudinary upload in a background thread so the Telegram event loop is never blocked."""
+    if not CLOUDINARY_AVAILABLE or not CLOUDINARY_URL or not local_path or not os.path.exists(local_path):
+        return
+    try:
+        url, pid = await asyncio.to_thread(upload_to_cloudinary, local_path, mtype, chat_id, msg_id)
+        if url and pid:
+            database.update_message_cloud_info(chat_id, msg_id, url, pid)
+            logger.info(f"  [BG CLOUDINARY OK] chat={chat_id} msg={msg_id} pid={pid}")
+    except Exception as e:
+        logger.warning(f"  [BG CLOUDINARY FAIL] chat={chat_id} msg={msg_id}: {e}")
 
 
 def is_admin(user_id: Optional[int]) -> bool:
@@ -371,7 +384,6 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         f"from='{s.full_name if s else '?'}' type={mt or 'text'}{' [TIMED]' if is_timed else ''}"
     )
     lp = await dl(ctx, fid, mt, chat_id, msg_id) if (mt and fid) else None
-    curl, cpid = upload_to_cloudinary(lp, mt, chat_id=chat_id, msg_id=msg_id) if (lp and mt) else (None, None)
     database.save_message(
         business_connection_id=conn_id,
         chat_id=chat_id, message_id=msg_id,
@@ -383,9 +395,9 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         caption=getattr(obj, "caption", None),
         created_at=date_iso, local_path=lp,
         is_timed=is_timed,
-        cloud_url=curl,
-        cloudinary_public_id=cpid,
     )
+    if lp and mt:
+        asyncio.create_task(bg_upload_to_cloudinary(lp, mt, chat_id, msg_id))
     return lp
 
 
@@ -468,45 +480,44 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not (rtype and rfid and rmid):
             continue
 
-        # Check if already captured in DB / Cloudinary
+        rs    = getattr(replied, "from_user", None)
+        rname = rs.full_name if rs else "Unknown"
+        rcap  = getattr(replied, "caption", None) or getattr(replied, "text", None)
+        rdate = (
+            replied.date.isoformat()
+            if hasattr(replied, "date") and replied.date
+            else date
+        )
+
         existing = database.get_message(cid, rmid)
-        if existing and existing.get("cloud_url"):
-            logger.info(f"  [SKIP TIMED UPLOAD] timed msg {rmid} already uploaded: {existing.get('cloud_url')}")
-            rcurl = existing.get("cloud_url")
-            rcpid = existing.get("cloudinary_public_id")
-            rpath = existing.get("local_path")
-        elif existing and existing.get("local_path") and os.path.exists(existing["local_path"]):
-            rpath = existing["local_path"]
-            rcurl, rcpid = upload_to_cloudinary(rpath, rtype, chat_id=cid, msg_id=rmid)
-            database.save_message(
-                business_connection_id=conn,
-                chat_id=cid, message_id=rmid,
-                sender_id=existing.get("sender_id"),
-                sender_name=existing.get("sender_name") or "Unknown",
-                sender_username=existing.get("sender_username"),
-                text=None, media_type=rtype, media_file_id=rfid,
-                caption=existing.get("caption"), created_at=existing.get("created_at") or date,
-                local_path=rpath, is_timed=True,
-                cloud_url=rcurl, cloudinary_public_id=rcpid,
-            )
-        else:
+        rpath = existing.get("local_path") if existing else None
+        rcurl = existing.get("cloud_url") if existing else None
+        rcpid = existing.get("cloudinary_public_id") if existing else None
+
+        # Download timed media if not already saved to disk
+        if not (rpath and os.path.exists(rpath)):
             logger.info(f"  [TIMED] capturing {rtype} msg_id={rmid} from {rname}")
             rpath, effective_fid = await dl_media_obj(ctx, replied, rtype, cid, rmid)
             rfid = effective_fid or rfid
-            rcurl, rcpid = upload_to_cloudinary(rpath, rtype, chat_id=cid, msg_id=rmid) if (rpath and rtype) else (None, None)
 
-            database.save_message(
-                business_connection_id=conn,
-                chat_id=cid, message_id=rmid,
-                sender_id=rs.id if rs else None,
-                sender_name=rname,
-                sender_username=rs.username if rs else None,
-                text=None, media_type=rtype, media_file_id=rfid,
-                caption=rcap, created_at=rdate, local_path=rpath,
-                is_timed=True,
-                cloud_url=rcurl,
-                cloudinary_public_id=rcpid,
-            )
+        # Save to database immediately as timed media
+        database.save_message(
+            business_connection_id=conn,
+            chat_id=cid, message_id=rmid,
+            sender_id=rs.id if rs else (existing.get("sender_id") if existing else None),
+            sender_name=rname if rname != "Unknown" else ((existing.get("sender_name") or "Unknown") if existing else "Unknown"),
+            sender_username=rs.username if rs else (existing.get("sender_username") if existing else None),
+            text=None, media_type=rtype, media_file_id=rfid,
+            caption=rcap or (existing.get("caption") if existing else None),
+            created_at=rdate, local_path=rpath,
+            is_timed=True,
+            cloud_url=rcurl,
+            cloudinary_public_id=rcpid,
+        )
+
+        # Non-blocking background upload to Cloudinary
+        if rpath and os.path.exists(rpath) and not rcurl:
+            asyncio.create_task(bg_upload_to_cloudinary(rpath, rtype, cid, rmid))
 
         oid = await get_owner(ctx, conn)
         if not oid:
@@ -531,14 +542,21 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         delivered = False
 
-        # Strategy 1: Deliver downloaded file or Cloudinary URL
-        if (rpath and os.path.exists(rpath)) or rcurl:
+        # Strategy 1: Deliver downloaded file or existing cloud URL
+        if rpath and os.path.exists(rpath):
             try:
-                await send_owner(ctx, oid, rtype, rpath, rfid, header, body, cloud_url=rcurl)
+                await send_owner(ctx, oid, rtype, rpath, rfid, header, body)
                 delivered = True
-                logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via file/cloud")
+                logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via local file")
             except Exception as e_send:
                 logger.warning(f"  [TIMED SEND FAIL] {e_send}")
+        elif rcurl:
+            try:
+                await send_owner(ctx, oid, rtype, None, rfid, header, body, cloud_url=rcurl)
+                delivered = True
+                logger.info(f"  [TIMED SUCCESS] Delivered to owner={oid} via cloud_url")
+            except Exception as e_cloud:
+                logger.warning(f"  [TIMED CLOUD FAIL] {e_cloud}")
 
         # Strategy 2: Copy message directly from chat to owner
         if not delivered:
@@ -1065,7 +1083,7 @@ async def cmd_purge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lpath = rec.get("local_path")
         cid   = rec.get("chat_id")
         mid   = rec.get("message_id")
-        if delete_from_cloudinary(pid, curl, mtype, chat_id=cid, msg_id=mid):
+        if await asyncio.to_thread(delete_from_cloudinary, pid, curl, mtype, chat_id=cid, msg_id=mid):
             c_res = True
         if lpath and os.path.exists(lpath):
             try:
@@ -1302,7 +1320,7 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 lpath = rec.get("local_path")
                 cid   = rec.get("chat_id")
                 mid   = rec.get("message_id")
-                if delete_from_cloudinary(pid, curl, mtype, chat_id=cid, msg_id=mid):
+                if await asyncio.to_thread(delete_from_cloudinary, pid, curl, mtype, chat_id=cid, msg_id=mid):
                     c_res = True
                 if lpath and os.path.exists(lpath):
                     try:
@@ -1352,7 +1370,6 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     logger.info(f"[DIRECT PM] from='{sname}' chat={cid} type={mt or 'text'}")
 
     lp = await dl(ctx, fid, mt, cid, mid) if (mt and fid) else None
-    curl, cpid = upload_to_cloudinary(lp, mt, chat_id=cid, msg_id=mid) if (lp and mt) else (None, None)
     database.save_message(
         business_connection_id="direct",
         chat_id=cid, message_id=mid,
@@ -1363,9 +1380,9 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         media_type=mt, media_file_id=fid,
         caption=msg.caption,
         created_at=date, local_path=lp,
-        cloud_url=curl,
-        cloudinary_public_id=cpid,
     )
+    if lp and mt:
+        asyncio.create_task(bg_upload_to_cloudinary(lp, mt, cid, mid))
 
     if mt and lp:
         fname = os.path.basename(lp)

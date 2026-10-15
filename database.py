@@ -234,6 +234,25 @@ def save_message(
         conn.commit()
 
 
+def update_message_cloud_info(
+    chat_id: int,
+    message_id: int,
+    cloud_url: str,
+    cloudinary_public_id: str,
+) -> None:
+    """Update cloud backup information for an existing message without replacing other fields."""
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE messages
+            SET cloud_url = ?, cloudinary_public_id = ?
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (cloud_url, cloudinary_public_id, chat_id, message_id),
+        )
+        conn.commit()
+
+
 def get_message(chat_id: int, message_id: int) -> Optional[Dict[str, Any]]:
     """Retrieve a cached message by chat_id and message_id."""
     with get_db_connection() as conn:
