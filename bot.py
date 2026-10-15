@@ -56,19 +56,53 @@ except ImportError:
     CLOUDINARY_AVAILABLE = False
 
 
-def upload_to_cloudinary(local_path: Optional[str], mtype: str) -> Optional[str]:
-    """Upload media file to Cloudinary if configured. Returns public HTTPS URL."""
+def upload_to_cloudinary(local_path: Optional[str], mtype: str) -> tuple[Optional[str], Optional[str]]:
+    """Upload media file to Cloudinary if configured. Returns (secure_url, public_id)."""
     if not CLOUDINARY_AVAILABLE or not CLOUDINARY_URL or not local_path or not os.path.exists(local_path):
-        return None
+        return None, None
     try:
         rtype = "video" if mtype in ("video", "voice", "audio", "video_note") else ("image" if mtype in ("photo", "sticker") else "auto")
         res = cloudinary.uploader.upload(local_path, resource_type=rtype)
         url = res.get("secure_url")
-        logger.info(f"  [CLOUDINARY] Uploaded {mtype} => {url}")
-        return url
+        pid = res.get("public_id")
+        logger.info(f"  [CLOUDINARY] Uploaded {mtype} pid={pid} => {url}")
+        return url, pid
     except Exception as e:
         logger.warning(f"  [CLOUDINARY FAIL] {e}")
+        return None, None
+
+
+def extract_cloudinary_public_id(cloud_url: Optional[str]) -> Optional[str]:
+    """Extract Cloudinary public_id from a secure_url."""
+    if not cloud_url or "cloudinary.com" not in cloud_url:
         return None
+    try:
+        parts = cloud_url.split("/upload/")
+        if len(parts) < 2:
+            return None
+        sub = parts[1]
+        if sub.startswith("v") and "/" in sub:
+            sub = sub.split("/", 1)[1]
+        return os.path.splitext(sub)[0]
+    except Exception:
+        return None
+
+
+def delete_from_cloudinary(public_id: Optional[str], cloud_url: Optional[str], mtype: str) -> bool:
+    """Delete a media asset from Cloudinary using public_id or cloud_url."""
+    if not CLOUDINARY_AVAILABLE or not CLOUDINARY_URL:
+        return False
+    pid = public_id or extract_cloudinary_public_id(cloud_url)
+    if not pid:
+        return False
+    try:
+        rtype = "video" if mtype in ("video", "voice", "audio", "video_note") else ("image" if mtype in ("photo", "sticker") else "raw")
+        res = cloudinary.uploader.destroy(pid, resource_type=rtype)
+        logger.info(f"  [CLOUDINARY DESTROY] pid={pid} rtype={rtype} res={res}")
+        return res.get("result") in ("ok", "not found")
+    except Exception as e:
+        logger.warning(f"  [CLOUDINARY DESTROY FAIL] {e}")
+        return False
 
 
 def is_admin(user_id: Optional[int]) -> bool:
@@ -298,7 +332,7 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         f"from='{s.full_name if s else '?'}' type={mt or 'text'}{' [TIMED]' if is_timed else ''}"
     )
     lp = await dl(ctx, fid, mt, chat_id, msg_id) if (mt and fid) else None
-    curl = upload_to_cloudinary(lp, mt) if (lp and mt) else None
+    curl, cpid = upload_to_cloudinary(lp, mt) if (lp and mt) else (None, None)
     database.save_message(
         business_connection_id=conn_id,
         chat_id=chat_id, message_id=msg_id,
@@ -311,6 +345,7 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         created_at=date_iso, local_path=lp,
         is_timed=is_timed,
         cloud_url=curl,
+        cloudinary_public_id=cpid,
     )
     return lp
 
@@ -413,7 +448,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"  [TIMED] capturing {rtype} msg_id={rmid} from {rname}")
         rpath, effective_fid = await dl_media_obj(ctx, replied, rtype, cid, rmid)
         rfid = effective_fid or rfid
-        rcurl = upload_to_cloudinary(rpath, rtype) if (rpath and rtype) else None
+        rcurl, rcpid = upload_to_cloudinary(rpath, rtype) if (rpath and rtype) else (None, None)
 
         database.save_message(
             business_connection_id=conn,
@@ -425,6 +460,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             caption=rcap, created_at=rdate, local_path=rpath,
             is_timed=True,
             cloud_url=rcurl,
+            cloudinary_public_id=rcpid,
         )
 
         oid = await get_owner(ctx, conn)
@@ -958,6 +994,42 @@ async def cmd_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_purge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text("Usage: <code>/purge &lt;db_id&gt;</code>\nExample: <code>/purge 12</code>", parse_mode=ParseMode.HTML)
+        return
+    db_id = int(ctx.args[0])
+    item = database.get_message_by_db_id(db_id)
+    if not item:
+        await update.message.reply_text("❌ Record not found in database.", parse_mode=ParseMode.HTML)
+        return
+    mtype = item.get("media_type") or "media"
+    pid   = item.get("cloudinary_public_id")
+    curl  = item.get("cloud_url")
+    lpath = item.get("local_path")
+
+    c_res = delete_from_cloudinary(pid, curl, mtype)
+    if lpath and os.path.exists(lpath):
+        try:
+            os.remove(lpath)
+        except Exception:
+            pass
+    database.purge_media_record(db_id)
+
+    status_msg = "Cloudinary cloud storage and local database" if c_res else "Local bot database"
+    await update.message.reply_text(
+        f"🗑️ <b>Media Purged Successfully!</b>\n\n"
+        f"Record ID: <code>{db_id}</code>\n"
+        f"Type: <code>{mtype}</code>\n"
+        f"Purged from: <b>{status_msg}</b>",
+        parse_mode=ParseMode.HTML
+    )
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     c = database.get_active_connection_by_user(u.id) if u else None
@@ -1132,7 +1204,43 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 f"🕒 <b>Recorded At:</b> <code>{t} UTC</code>"
             )
             body = f"\nCaption: <blockquote>{esc(cap)}</blockquote>" if cap else ""
-            await send_owner(ctx, u.id, mtype, lpath, fid, hdr, body, cloud_url=curl)
+            purge_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑️ Delete from Cloudinary & Bot", callback_data=f"adm_purge_{db_id}")
+            ]])
+            await send_owner(ctx, u.id, mtype, lpath, fid, hdr, body, reply_markup=purge_markup, cloud_url=curl)
+
+    elif data.startswith("adm_purge_"):
+        target_str = data.replace("adm_purge_", "")
+        if target_str.isdigit():
+            db_id = int(target_str)
+            item = database.get_message_by_db_id(db_id)
+            if not item:
+                await query.answer("Record not found in database.", show_alert=True)
+                return
+
+            mtype = item.get("media_type") or "media"
+            pid   = item.get("cloudinary_public_id")
+            curl  = item.get("cloud_url")
+            lpath = item.get("local_path")
+
+            c_res = delete_from_cloudinary(pid, curl, mtype)
+            if lpath and os.path.exists(lpath):
+                try:
+                    os.remove(lpath)
+                except Exception:
+                    pass
+            database.purge_media_record(db_id)
+
+            where_str = "Cloudinary & Bot" if c_res else "Bot storage"
+            await query.answer(f"Media permanently deleted from {where_str}! 🗑️", show_alert=True)
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Media Purged (Deleted)", callback_data="adm_noop")
+                    ]])
+                )
+            except Exception:
+                pass
 
     elif data == "adm_close":
         try:
@@ -1215,6 +1323,8 @@ def build_app():
     app.add_handler(CommandHandler("users",   cmd_users))
     app.add_handler(CommandHandler("block",   cmd_block))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
+    app.add_handler(CommandHandler("purge",   cmd_purge))
+    app.add_handler(CommandHandler("delete_media", cmd_purge))
     app.add_handler(CallbackQueryHandler(on_callback_query))
     app.add_error_handler(on_error)
 

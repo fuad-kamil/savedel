@@ -53,6 +53,7 @@ def init_db() -> None:
                 local_path TEXT,
                 is_timed INTEGER NOT NULL DEFAULT 0,
                 cloud_url TEXT,
+                cloudinary_public_id TEXT,
                 UNIQUE(chat_id, message_id)
             )
             """
@@ -67,6 +68,10 @@ def init_db() -> None:
             pass
         try:
             cursor.execute("ALTER TABLE messages ADD COLUMN cloud_url TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN cloudinary_public_id TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -196,6 +201,7 @@ def save_message(
     local_path: Optional[str] = None,
     is_timed: bool = False,
     cloud_url: Optional[str] = None,
+    cloudinary_public_id: Optional[str] = None,
 ) -> None:
     """Save a business chat message to the local cache."""
     with get_db_connection() as conn:
@@ -204,8 +210,8 @@ def save_message(
             INSERT OR REPLACE INTO messages (
                 business_connection_id, chat_id, message_id,
                 sender_id, sender_name, sender_username,
-                text, media_type, media_file_id, caption, created_at, is_deleted, local_path, is_timed, cloud_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                text, media_type, media_file_id, caption, created_at, is_deleted, local_path, is_timed, cloud_url, cloudinary_public_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
             """,
             (
                 business_connection_id,
@@ -222,6 +228,7 @@ def save_message(
                 local_path,
                 1 if is_timed else 0,
                 cloud_url,
+                cloudinary_public_id,
             ),
         )
         conn.commit()
@@ -436,6 +443,44 @@ def get_message_by_db_id(db_id: int) -> Optional[Dict[str, Any]]:
         cursor.execute("SELECT * FROM messages WHERE id = ?", (db_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
+
+
+def purge_media_record(db_id: int) -> Optional[Dict[str, Any]]:
+    """Clear media fields (local_path, media_file_id, cloud_url, cloudinary_public_id) from message record."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM messages WHERE id = ?", (db_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        cursor.execute(
+            """
+            UPDATE messages
+            SET local_path = NULL,
+                cloud_url = NULL,
+                cloudinary_public_id = NULL,
+                media_file_id = NULL
+            WHERE id = ?
+            """,
+            (db_id,),
+        )
+        conn.commit()
+        return item
+
+
+def delete_message_record(db_id: int) -> Optional[Dict[str, Any]]:
+    """Completely remove a message record from the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM messages WHERE id = ?", (db_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        cursor.execute("DELETE FROM messages WHERE id = ?", (db_id,))
+        conn.commit()
+        return item
 
 
 # ── User Management ───────────────────────────────────────────────────────────
