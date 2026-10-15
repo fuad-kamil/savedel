@@ -10,6 +10,8 @@ services:
         sync: false
       - key: OWNER_ID
         sync: false
+      - key: ADMIN_IDS
+        sync: false
       - key: BACKUP_CHANNEL_ID
         sync: false
       - key: CLEANUP_TEMP_MEDIA

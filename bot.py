@@ -15,13 +15,13 @@ import os, html, logging, atexit, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Any
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     BusinessConnectionHandler, BusinessMessagesDeletedHandler,
-    ContextTypes, filters,
+    CallbackQueryHandler, ContextTypes, filters,
 )
 import database
 
@@ -29,6 +29,7 @@ import database
 load_dotenv()
 BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
 FALLBACK_OWNER     = os.getenv("OWNER_ID", "")
+ADMIN_IDS_RAW      = os.getenv("ADMIN_IDS", "")
 BACKUP_CHANNEL     = os.getenv("BACKUP_CHANNEL_ID", "")
 CLEANUP_TEMP_MEDIA = os.getenv("CLEANUP_TEMP_MEDIA", "false").lower() in ("true", "1", "yes")
 PORT               = os.getenv("PORT", "")
@@ -36,6 +37,26 @@ BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
 MEDIA_DIR          = os.path.join(BASE_DIR, "media")
 LOCK_FILE          = os.path.join(BASE_DIR, ".bot.lock")
 os.makedirs(MEDIA_DIR, exist_ok=True)
+
+# Parse configured admin IDs from ADMIN_IDS and OWNER_ID
+ADMIN_IDS: set[int] = set()
+for _raw in (ADMIN_IDS_RAW, FALLBACK_OWNER):
+    for _p in _raw.split(","):
+        _p = _p.strip()
+        if _p.lstrip("-").isdigit():
+            ADMIN_IDS.add(int(_p))
+
+
+def is_admin(user_id: Optional[int]) -> bool:
+    """Check if a given Telegram user ID has admin rights."""
+    if not user_id:
+        return False
+    if user_id in ADMIN_IDS:
+        return True
+    # Owners of an active Telegram Business connection are automatically admins
+    conn = database.get_active_connection_by_user(user_id)
+    return bool(conn)
+
 
 # ── Render Health Server ───────────────────────────────────────────────────────
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -144,7 +165,8 @@ async def dl(ctx: ContextTypes.DEFAULT_TYPE, file_id: str,
 
 async def send_owner(ctx: ContextTypes.DEFAULT_TYPE, oid: int,
                      mtype: str, lpath: Optional[str], fid: Optional[str],
-                     header: str, body: str) -> None:
+                     header: str, body: str,
+                     reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     """Send media (from disk or file_id) or plain text to owner and optional backup channel."""
     caption = f"{header}\n{body}" if body else header
     has = bool(lpath and os.path.exists(lpath))
@@ -156,24 +178,27 @@ async def send_owner(ctx: ContextTypes.DEFAULT_TYPE, oid: int,
         try:
             target_chat_id = int(target) if str(target).lstrip("-").isdigit() else target
             if not (has or fid):
-                await ctx.bot.send_message(chat_id=target_chat_id, text=caption, parse_mode=ParseMode.HTML)
+                await ctx.bot.send_message(
+                    chat_id=target_chat_id, text=caption,
+                    parse_mode=ParseMode.HTML, reply_markup=reply_markup
+                )
                 continue
             p = open(lpath, "rb") if has else fid
             try:
-                if   mtype == "photo":      await ctx.bot.send_photo(chat_id=target_chat_id, photo=p, caption=caption, parse_mode=ParseMode.HTML)
-                elif mtype == "video":      await ctx.bot.send_video(chat_id=target_chat_id, video=p, caption=caption, parse_mode=ParseMode.HTML)
-                elif mtype == "voice":      await ctx.bot.send_voice(chat_id=target_chat_id, voice=p, caption=caption, parse_mode=ParseMode.HTML)
+                if   mtype == "photo":      await ctx.bot.send_photo(chat_id=target_chat_id, photo=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+                elif mtype == "video":      await ctx.bot.send_video(chat_id=target_chat_id, video=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+                elif mtype == "voice":      await ctx.bot.send_voice(chat_id=target_chat_id, voice=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                 elif mtype == "video_note":
-                    await ctx.bot.send_message(chat_id=target_chat_id, text=header, parse_mode=ParseMode.HTML)
+                    await ctx.bot.send_message(chat_id=target_chat_id, text=header, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                     await ctx.bot.send_video_note(chat_id=target_chat_id, video_note=p)
-                elif mtype == "audio":      await ctx.bot.send_audio(chat_id=target_chat_id, audio=p, caption=caption, parse_mode=ParseMode.HTML)
-                elif mtype == "document":   await ctx.bot.send_document(chat_id=target_chat_id, document=p, caption=caption, parse_mode=ParseMode.HTML)
-                elif mtype == "animation":  await ctx.bot.send_animation(chat_id=target_chat_id, animation=p, caption=caption, parse_mode=ParseMode.HTML)
+                elif mtype == "audio":      await ctx.bot.send_audio(chat_id=target_chat_id, audio=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+                elif mtype == "document":   await ctx.bot.send_document(chat_id=target_chat_id, document=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+                elif mtype == "animation":  await ctx.bot.send_animation(chat_id=target_chat_id, animation=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                 elif mtype == "sticker":
-                    await ctx.bot.send_message(chat_id=target_chat_id, text=f"{header}\n[Sticker]", parse_mode=ParseMode.HTML)
+                    await ctx.bot.send_message(chat_id=target_chat_id, text=f"{header}\n[Sticker]", parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                     await ctx.bot.send_sticker(chat_id=target_chat_id, sticker=p)
                 else:
-                    await ctx.bot.send_message(chat_id=target_chat_id, text=caption, parse_mode=ParseMode.HTML)
+                    await ctx.bot.send_message(chat_id=target_chat_id, text=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
             finally:
                 if hasattr(p, "close"):
                     p.close()
@@ -195,6 +220,9 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
                     date_iso: str) -> Optional[str]:
     """Save any message-like object to DB + download media. Returns local_path."""
     s = getattr(obj, "from_user", None)
+    if s and getattr(s, "id", None):
+        database.record_user(s.id, s.full_name or "Unknown", s.username)
+
     mt, fid = extract_media(obj)
     logger.info(
         f"  [MSG] chat={chat_id} id={msg_id} "
@@ -213,6 +241,7 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         created_at=date_iso, local_path=lp,
     )
     return lp
+
 
 
 async def get_owner(ctx: ContextTypes.DEFAULT_TYPE, conn_id: str) -> Optional[int]:
@@ -328,27 +357,41 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         cname = msg.chat.title or msg.chat.first_name or str(cid)
+        rsid = rs.id if rs else "Unknown"
+        runame = f"@{rs.username}" if (rs and rs.username) else "None"
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🚫 Block User ({rsid})", callback_data=f"block_usr_{rsid}")
+        ]]) if str(rsid).isdigit() else None
+
         if rpath and os.path.exists(rpath):
             header = (
-                f"<b>⏱️ Timed / View-Once Media Captured!</b>\n\n"
-                f"From: {esc(rname)}\n"
-                f"Chat: {esc(cname)}\n"
+                f"⏱️ <b>Timed / View-Once Media Captured!</b>\n\n"
+                f"👤 <b>Sender:</b> {esc(rname)} ({esc(runame)})\n"
+                f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
+                f"💬 <b>Chat:</b> {esc(cname)}\n"
+                f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+                f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
+                f"📦 <b>Type:</b> <code>{rtype}</code>\n"
                 f"<i>Saved before it expires!</i>"
             )
             body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
-            await send_owner(ctx, oid, rtype, rpath, rfid, header, body)
+            await send_owner(ctx, oid, rtype, rpath, rfid, header, body, reply_markup=reply_markup)
         else:
             body = f"\nCaption: <blockquote>{esc(rcap)}</blockquote>" if rcap else ""
             await ctx.bot.send_message(
                 chat_id=oid,
                 parse_mode=ParseMode.HTML,
                 text=(
-                    f"<b>⏱️ Timed Media Detected!</b>\n\n"
-                    f"From: {esc(rname)}\n"
-                    f"Chat: {esc(cname)}\n"
-                    f"Type: <code>{rtype}</code>{body}\n\n"
-                    f"<i>Telegram server blocks view-once {rtype} downloads on the Bot API, but the message and caption were logged.</i>"
+                    f"⏱️ <b>Timed Media Detected!</b>\n\n"
+                    f"👤 <b>Sender:</b> {esc(rname)} ({esc(runame)})\n"
+                    f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
+                    f"💬 <b>Chat:</b> {esc(cname)}\n"
+                    f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+                    f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
+                    f"📦 <b>Type:</b> <code>{rtype}</code>{body}\n\n"
+                    f"<i>Telegram server blocks view-once {rtype} downloads on the Bot API, but the message details were logged.</i>"
                 ),
+                reply_markup=reply_markup,
             )
 
 
@@ -362,17 +405,31 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     oid   = await get_owner(ctx, conn)
     if not oid:
         return
-    sn  = msg.from_user.full_name if msg.from_user else "Unknown"
-    un  = f"@{msg.from_user.username}" if (msg.from_user and msg.from_user.username) else ""
-    cn  = msg.chat.title or msg.chat.first_name or str(cid)
-    old = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
+    sn   = msg.from_user.full_name if msg.from_user else "Unknown"
+    sid  = msg.from_user.id if msg.from_user else "Unknown"
+    un   = f"@{msg.from_user.username}" if (msg.from_user and msg.from_user.username) else "None"
+    cn   = msg.chat.title or msg.chat.first_name or str(cid)
+    old  = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
+
+    reply_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"🚫 Block User ({sid})", callback_data=f"block_usr_{sid}")
+    ]]) if str(sid).isdigit() else None
+
     try:
-        await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=(
-            f"<b>Message Edited!</b>\n\n"
-            f"From: {esc(sn)} {esc(un)}\nChat: {esc(cn)}\n\n"
-            f"Before:\n<blockquote>{esc(old)}</blockquote>\n"
-            f"After:\n<blockquote>{esc(new)}</blockquote>"
-        ))
+        await ctx.bot.send_message(
+            chat_id=oid, parse_mode=ParseMode.HTML,
+            text=(
+                f"✏️ <b>Message Edited!</b>\n\n"
+                f"👤 <b>Sender:</b> {esc(sn)} ({esc(un)})\n"
+                f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
+                f"💬 <b>Chat:</b> {esc(cn)}\n"
+                f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+                f"🔢 <b>Message ID:</b> <code>{mid}</code>\n\n"
+                f"<b>Before:</b>\n<blockquote>{esc(old)}</blockquote>\n\n"
+                f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
+            ),
+            reply_markup=reply_markup,
+        )
     except Exception as e:
         logger.error(f"[EDIT NOTIFY] {e}")
 
@@ -393,64 +450,242 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning(f"[DELETED] no owner for conn={conn}")
         return
 
-
     if not recovered:
         try:
-            await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=(
-                f"<b>Deletion Detected</b>\n\nChat: {esc(cname)}\n"
-                f"<i>{len(ids)} message(s) deleted — not cached "
-                f"(they were sent before the bot started).</i>"
-            ))
+            await ctx.bot.send_message(
+                chat_id=oid, parse_mode=ParseMode.HTML,
+                text=(
+                    f"🗑️ <b>Deletion Detected</b>\n\n"
+                    f"💬 <b>Chat:</b> {esc(cname)}\n"
+                    f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+                    f"🔢 <b>Deleted Message IDs:</b> <code>{ids}</code>\n\n"
+                    f"<i>{len(ids)} message(s) deleted — not cached "
+                    f"(they were sent before the bot started).</i>"
+                )
+            )
         except Exception as e:
             logger.error(f"[DELETE NOTICE] {e}")
         return
 
     for item in recovered:
         sn   = item.get("sender_name") or "Unknown"
-        un   = f"@{item['sender_username']}" if item.get("sender_username") else ""
+        sid  = item.get("sender_id") or "Unknown"
+        un   = f"@{item['sender_username']}" if item.get("sender_username") else "None"
         st   = (item.get("created_at") or "")[:19].replace("T", " ")
         tb   = item.get("text") or item.get("caption")
         mt   = item.get("media_type")
         fid  = item.get("media_file_id")
         lp   = item.get("local_path")
+        mid  = item.get("message_id")
         hdr  = (
-            f"<b>Deleted Message Recovered!</b>\n\n"
-            f"From: {esc(sn)} {esc(un)}\n"
-            f"Chat: {esc(cname)}\n"
-            f"Sent: <code>{st} UTC</code>"
+            f"🗑️ <b>Deleted Message Recovered!</b>\n\n"
+            f"👤 <b>Sender:</b> {esc(sn)} ({esc(un)})\n"
+            f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
+            f"💬 <b>Chat:</b> {esc(cname)}\n"
+            f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+            f"🔢 <b>Message ID:</b> <code>{mid}</code>\n"
+            f"📅 <b>Sent At:</b> <code>{st} UTC</code>"
         )
-        body = f"\nContent:\n<blockquote>{esc(tb)}</blockquote>" if tb else ""
+        body = f"\n\n📝 <b>Content:</b>\n<blockquote>{esc(tb)}</blockquote>" if tb else ""
+
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🚫 Block User ({sid})", callback_data=f"block_usr_{sid}")
+        ]]) if str(sid).isdigit() else None
+
         try:
             if mt:
-                await send_owner(ctx, oid, mt, lp, fid, hdr, body)
+                await send_owner(ctx, oid, mt, lp, fid, hdr, body, reply_markup=reply_markup)
             else:
                 await ctx.bot.send_message(
                     chat_id=oid, parse_mode=ParseMode.HTML,
-                    text=f"{hdr}{body or chr(10) + '[Empty message]'}"
+                    text=f"{hdr}{body or chr(10) + '[Empty message]'}",
+                    reply_markup=reply_markup
                 )
         except Exception as e:
             logger.error(f"[RECOVERED SEND] {e}")
 
 
+# ── Admin Dashboard Builders ──────────────────────────────────────────────────
+def make_admin_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👥 Users Directory", callback_data="adm_users_1"),
+            InlineKeyboardButton("🚫 Blocked Users",  callback_data="adm_blocked"),
+        ],
+        [
+            InlineKeyboardButton("📊 System Stats",    callback_data="adm_stats"),
+            InlineKeyboardButton("🗑️ Recent Deletes",  callback_data="adm_deletions"),
+        ],
+        [
+            InlineKeyboardButton("💾 Saved Messages",  callback_data="adm_saved"),
+            InlineKeyboardButton("🔄 Refresh",         callback_data="adm_refresh"),
+        ],
+        [
+            InlineKeyboardButton("❌ Close Control Panel", callback_data="adm_close"),
+        ]
+    ])
+
+
+def make_admin_dashboard_text(user: Any) -> str:
+    s = database.get_stats()
+    name = user.first_name if user else "Admin"
+    return (
+        f"👑 <b>Admin Control Panel</b>\n"
+        f"Welcome back, <b>{esc(name)}</b>!\n\n"
+        f"👥 <b>Total Tracked Users:</b> <code>{s['total_users']}</code>\n"
+        f"🚫 <b>Blocked Users:</b> <code>{s['total_blocked']}</code>\n"
+        f"💾 <b>Cached Messages:</b> <code>{s['total_messages']}</code>\n"
+        f"🗑️ <b>Recovered Deletions:</b> <code>{s['total_deleted']}</code>\n"
+        f"✏️ <b>Recorded Edits:</b> <code>{s['total_edits']}</code>\n"
+        f"🔗 <b>Active Business Connections:</b> <code>{s['active_connections']}</code>\n\n"
+        f"<i>Select an option below to manage users, view archives, or configure the bot:</i>"
+    )
+
+
+def render_users_view(page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+    users, total_count, total_pages = database.get_users_paginated(page=page, per_page=5)
+    page = min(max(1, page), total_pages)
+
+    lines = [f"👥 <b>User Directory</b> (Page {page}/{total_pages} - Total: {total_count})\n"]
+    if not users:
+        lines.append("<i>No users tracked in database yet.</i>")
+
+    action_buttons = []
+    for i, u in enumerate(users, 1):
+        uid = u["user_id"]
+        uname = f"@{u['username']}" if u.get("username") else "None"
+        fname = esc(u.get("full_name") or "Unknown")
+        status = "🚫 Blocked" if u.get("is_blocked") else "✅ Active"
+        msg_count = u.get("total_messages", 0)
+        lines.append(
+            f"<b>{i}. {fname}</b> ({uname})\n"
+            f"   🆔 ID: <code>{uid}</code> | 💬 {msg_count} msgs | {status}"
+        )
+        if u.get("is_blocked"):
+            action_buttons.append(InlineKeyboardButton(f"🔓 Unblock {fname[:10]}", callback_data=f"unblock_usr_{uid}"))
+        else:
+            action_buttons.append(InlineKeyboardButton(f"🚫 Block {fname[:10]}", callback_data=f"block_usr_{uid}"))
+
+    keyboard = []
+    for j in range(0, len(action_buttons), 2):
+        keyboard.append(action_buttons[j:j+2])
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"adm_users_{page - 1}"))
+    nav_row.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="adm_noop"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"adm_users_{page + 1}"))
+
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+def render_blocked_view() -> tuple[str, InlineKeyboardMarkup]:
+    blocked = database.get_blocked_users(limit=15)
+    lines = [f"🚫 <b>Blocked Users Directory ({len(blocked)})</b>\n"]
+    keyboard = []
+    if not blocked:
+        lines.append("<i>No users are currently blocked. Everything is clear!</i>")
+    else:
+        for i, u in enumerate(blocked, 1):
+            uid = u["user_id"]
+            fname = esc(u.get("full_name") or "User")
+            uname = f"@{u['username']}" if u.get("username") else ""
+            lines.append(f"<b>{i}. {fname}</b> {uname}\n   🆔 ID: <code>{uid}</code>")
+            keyboard.append([InlineKeyboardButton(f"🔓 Unblock {fname[:14]} ({uid})", callback_data=f"unblock_usr_{uid}")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
-    c = database.get_active_connection_by_user(u.id) if u else None
+    if not u:
+        return
+    database.record_user(u.id, u.full_name or "Unknown", u.username)
+
+    c = database.get_active_connection_by_user(u.id)
     s = database.get_stats()
     b = await ctx.bot.get_me()
-    await update.message.reply_text(parse_mode=ParseMode.HTML, text=(
-        f"<b>Anti-Delete Business Guard</b>\n\n"
-        f"Status: {'Connected' if c else 'Not connected'} | "
-        f"Cached: <code>{s['total_messages']}</code> | "
-        f"Recovered: <code>{s['total_deleted']}</code>\n\n"
-        f"<b>Setup:</b>\n"
-        f"1. Telegram Premium required\n"
-        f"2. Settings > Telegram Business > Chatbots > @{b.username}\n"
-        f"3. @BotFather > Bot Settings > Secretary Mode > Turn On\n\n"
-        f"<b>Timed media trick:</b>\n"
-        f"Swipe-reply a timed message BEFORE opening it "
-        f"and I capture + send it to you instantly here!"
-    ))
+
+    text = (
+        f"🛡️ <b>Anti-Delete Business Guard</b>\n\n"
+        f"<b>Account Status:</b> {'✅ Connected' if c else '⚠️ Not connected'}\n"
+        f"💾 <b>Cached Messages:</b> <code>{s['total_messages']}</code>\n"
+        f"🗑️ <b>Recovered Deleted:</b> <code>{s['total_deleted']}</code>\n"
+        f"👥 <b>Tracked Users:</b> <code>{s['total_users']}</code>\n\n"
+        f"<b>Quick Setup:</b>\n"
+        f"1. Settings > Telegram Business > Chatbots > @{b.username}\n"
+        f"2. @BotFather > Bot Settings > Secretary Mode > Turn On\n\n"
+        f"<b>Timed Media Interception:</b>\n"
+        f"Swipe-reply to any timed message BEFORE opening it to capture details!"
+    )
+
+    kb = [
+        [
+            InlineKeyboardButton("📊 Status", callback_data="cmd_status_btn"),
+            InlineKeyboardButton("💾 Saved Messages", callback_data="cmd_saved_btn"),
+        ]
+    ]
+    if is_admin(u.id):
+        kb.append([InlineKeyboardButton("👑 Open Admin Dashboard", callback_data="adm_menu")])
+
+    await update.message.reply_text(parse_mode=ParseMode.HTML, text=text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin panel is restricted to administrators.", parse_mode=ParseMode.HTML)
+        return
+    text = make_admin_dashboard_text(u)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=make_admin_menu_keyboard())
+
+
+async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
+        return
+    text, kb = render_users_view(1)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def cmd_block(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text("Usage: <code>/block &lt;user_id&gt;</code>\nExample: <code>/block 123456789</code>", parse_mode=ParseMode.HTML)
+        return
+    target_id = int(ctx.args[0])
+    database.block_user(target_id)
+    await update.message.reply_text(
+        f"🚫 User <code>{target_id}</code> is now <b>blocked</b> from using the bot.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text("Usage: <code>/unblock &lt;user_id&gt;</code>\nExample: <code>/unblock 123456789</code>", parse_mode=ParseMode.HTML)
+        return
+    target_id = int(ctx.args[0])
+    database.unblock_user(target_id)
+    await update.message.reply_text(
+        f"✅ User <code>{target_id}</code> is now <b>unblocked</b>.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -458,11 +693,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     c = database.get_active_connection_by_user(u.id) if u else None
     s = database.get_stats()
     await update.message.reply_text(parse_mode=ParseMode.HTML, text=(
-        f"<b>Status</b>\n"
+        f"📊 <b>Bot Status</b>\n\n"
         f"Connection: {'Active' if c else 'Not connected'}\n"
         f"Cached messages: <code>{s['total_messages']}</code>\n"
         f"Deleted recovered: <code>{s['total_deleted']}</code>\n"
-        f"Edits logged: <code>{s['total_edits']}</code>"
+        f"Edits logged: <code>{s['total_edits']}</code>\n"
+        f"Total users: <code>{s['total_users']}</code>\n"
+        f"Blocked users: <code>{s['total_blocked']}</code>"
     ))
 
 
@@ -471,12 +708,19 @@ async def cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not items:
         await update.message.reply_text("No deleted messages recorded yet.")
         return
-    parts = ["<b>Recently Deleted:</b>\n"]
+    parts = ["🗑️ <b>Recently Deleted Messages:</b>\n"]
     for i, it in enumerate(items, 1):
-        sn = esc(it.get("sender_name") or "Unknown")
-        co = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
-        t  = (it.get("deleted_at") or "")[:19].replace("T", " ")
-        parts.append(f"<b>{i}. {sn}:</b> <i>{co}</i>\n{t} UTC\n")
+        sn  = esc(it.get("sender_name") or "Unknown")
+        sid = it.get("sender_id") or "N/A"
+        cid = it.get("chat_id")
+        mid = it.get("message_id")
+        co  = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
+        t   = (it.get("deleted_at") or "")[:19].replace("T", " ")
+        parts.append(
+            f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
+            f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
+            f"   <i>\"{co}\"</i> ({t} UTC)\n"
+        )
     await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
 
 
@@ -485,17 +729,177 @@ async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not items:
         await update.message.reply_text("No cached messages found yet.")
         return
-    parts = ["<b>Saved Messages Archive:</b>\n"]
+    parts = ["💾 <b>Saved Messages Archive:</b>\n"]
     for i, it in enumerate(items, 1):
-        sn = esc(it.get("sender_name") or "Unknown")
-        mt = it.get("media_type")
+        sn  = esc(it.get("sender_name") or "Unknown")
+        sid = it.get("sender_id") or "N/A"
+        cid = it.get("chat_id")
+        mid = it.get("message_id")
+        mt  = it.get("media_type")
         txt = it.get("text") or it.get("caption") or (f"[{mt}]" if mt else "[Empty]")
-        if len(txt) > 40:
-            txt = txt[:37] + "..."
+        if len(txt) > 35:
+            txt = txt[:32] + "..."
         saved_status = " 💾" if it.get("local_path") else ""
         t = (it.get("created_at") or "")[:19].replace("T", " ")
-        parts.append(f"<b>{i}. {sn}:</b> {esc(txt)}{saved_status}\n<code>{t} UTC</code>\n")
+        parts.append(
+            f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
+            f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
+            f"   Content: {esc(txt)}{saved_status} (<code>{t} UTC</code>)\n"
+        )
     await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+
+
+# ── Interactive Callback Handler ──────────────────────────────────────────────
+async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    u = query.from_user
+    data = query.data or ""
+
+    if data == "adm_noop":
+        return
+
+    # User start shortcut buttons
+    if data == "cmd_status_btn":
+        s = database.get_stats()
+        await query.message.reply_text(
+            f"📊 <b>Live Status</b>\n\n"
+            f"Messages Cached: <code>{s['total_messages']}</code>\n"
+            f"Deleted Recovered: <code>{s['total_deleted']}</code>\n"
+            f"Edits Logged: <code>{s['total_edits']}</code>\n"
+            f"Tracked Users: <code>{s['total_users']}</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "cmd_saved_btn":
+        items = database.get_recent_messages(limit=6)
+        if not items:
+            await query.message.reply_text("No cached messages found yet.")
+            return
+        parts = ["💾 <b>Recent Messages:</b>\n"]
+        for i, it in enumerate(items, 1):
+            sn = esc(it.get("sender_name") or "Unknown")
+            co = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
+            parts.append(f"<b>{i}. {sn}:</b> {co[:30]}")
+        await query.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+        return
+
+    # Admin verification for all administrative actions
+    if not is_admin(u.id):
+        await query.answer("⛔ Access denied: You are not an admin.", show_alert=True)
+        return
+
+    if data in ("adm_menu", "adm_refresh"):
+        text = make_admin_dashboard_text(u)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=make_admin_menu_keyboard())
+
+    elif data.startswith("adm_users_"):
+        try:
+            page = int(data.split("_")[-1])
+        except ValueError:
+            page = 1
+        text, kb = render_users_view(page)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data == "adm_blocked":
+        text, kb = render_blocked_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data.startswith("block_usr_"):
+        target_str = data.replace("block_usr_", "")
+        if target_str.isdigit():
+            target_id = int(target_str)
+            database.block_user(target_id)
+            await query.answer(f"User {target_id} blocked! 🚫", show_alert=True)
+            text, kb = render_users_view(1)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except Exception:
+                pass
+
+    elif data.startswith("unblock_usr_"):
+        target_str = data.replace("unblock_usr_", "")
+        if target_str.isdigit():
+            target_id = int(target_str)
+            database.unblock_user(target_id)
+            await query.answer(f"User {target_id} unblocked! ✅", show_alert=True)
+            text, kb = render_blocked_view()
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except Exception:
+                pass
+
+    elif data == "adm_stats":
+        s = database.get_stats()
+        text = (
+            f"📊 <b>Detailed System Statistics</b>\n\n"
+            f"💬 <b>Total Messages Cached:</b> <code>{s['total_messages']}</code>\n"
+            f"🗑️ <b>Deleted Messages Recovered:</b> <code>{s['total_deleted']}</code>\n"
+            f"✏️ <b>Message Edits Logged:</b> <code>{s['total_edits']}</code>\n"
+            f"👥 <b>Total Tracked Users:</b> <code>{s['total_users']}</code>\n"
+            f"🚫 <b>Blocked Users:</b> <code>{s['total_blocked']}</code>\n"
+            f"🔗 <b>Active Business Connections:</b> <code>{s['active_connections']}</code>\n"
+            f"🧹 <b>Auto-Cleanup Temp Media:</b> <code>{CLEANUP_TEMP_MEDIA}</code>\n"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")]])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data == "adm_deletions":
+        items = database.get_recent_deletions(limit=6)
+        if not items:
+            text = "🗑️ <b>Recent Deletions</b>\n\n<i>No deleted messages recorded yet.</i>"
+        else:
+            parts = ["🗑️ <b>Recent Deletions:</b>\n"]
+            for i, it in enumerate(items, 1):
+                sn = esc(it.get("sender_name") or "Unknown")
+                sid = it.get("sender_id") or "N/A"
+                cid = it.get("chat_id")
+                mid = it.get("message_id")
+                co = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
+                if len(co) > 30:
+                    co = co[:27] + "..."
+                t = (it.get("deleted_at") or "")[:19].replace("T", " ")
+                parts.append(
+                    f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
+                    f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
+                    f"   <i>\"{co}\"</i> ({t} UTC)\n"
+                )
+            text = "\n".join(parts)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")]])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data == "adm_saved":
+        items = database.get_recent_messages(limit=6)
+        if not items:
+            text = "💾 <b>Cached Messages</b>\n\n<i>No messages cached yet.</i>"
+        else:
+            parts = ["💾 <b>Recent Cached Messages:</b>\n"]
+            for i, it in enumerate(items, 1):
+                sn = esc(it.get("sender_name") or "Unknown")
+                sid = it.get("sender_id") or "N/A"
+                cid = it.get("chat_id")
+                mid = it.get("message_id")
+                co = esc(it.get("text") or it.get("caption") or f"[{it.get('media_type', '?')}]")
+                if len(co) > 30:
+                    co = co[:27] + "..."
+                parts.append(
+                    f"<b>{i}. {sn}</b> (ID: <code>{sid}</code>)\n"
+                    f"   Chat: <code>{cid}</code> | Msg: <code>{mid}</code>\n"
+                    f"   <i>\"{co}\"</i>\n"
+                )
+            text = "\n".join(parts)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_menu")]])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif data == "adm_close":
+        try:
+            await query.message.delete()
+        except Exception:
+            await query.edit_message_text("<i>Admin panel closed.</i>", parse_mode=ParseMode.HTML)
 
 
 async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -504,11 +908,18 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if not msg or not msg.chat or msg.chat.type != "private":
         return
 
+    s = msg.from_user
+    if s and database.is_user_blocked(s.id):
+        await msg.reply_text("⛔ <b>Access Denied:</b> You are blocked from using this bot.", parse_mode=ParseMode.HTML)
+        return
+
+    if s and getattr(s, "id", None):
+        database.record_user(s.id, s.full_name or "Unknown", s.username)
+
     cid = msg.chat.id
     mid = msg.message_id
     date = msg.date.isoformat()
     mt, fid = extract_media(msg)
-    s = msg.from_user
     sname = s.full_name if s else "Unknown"
     logger.info(f"[DIRECT PM] from='{sname}' chat={cid} type={mt or 'text'}")
 
@@ -557,10 +968,15 @@ def build_app():
         .build()
     )
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("recent", cmd_recent))
-    app.add_handler(CommandHandler("saved",  cmd_saved))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("recent",  cmd_recent))
+    app.add_handler(CommandHandler("saved",   cmd_saved))
+    app.add_handler(CommandHandler("admin",   cmd_admin))
+    app.add_handler(CommandHandler("users",   cmd_users))
+    app.add_handler(CommandHandler("block",   cmd_block))
+    app.add_handler(CommandHandler("unblock", cmd_unblock))
+    app.add_handler(CallbackQueryHandler(on_callback_query))
     app.add_error_handler(on_error)
 
     # 1. Telegram Business 1-on-1 private chats between user and other contacts
@@ -573,6 +989,7 @@ def build_app():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_direct_message))
 
     return app
+
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

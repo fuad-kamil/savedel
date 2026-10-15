@@ -74,6 +74,40 @@ def init_db() -> None:
             """
         )
 
+        # User management table
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                username TEXT,
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                total_messages INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_blocked ON users(is_blocked)"
+        )
+
+        # Populate users from existing message cache if any
+        try:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO users (user_id, full_name, username, first_seen, last_seen, total_messages)
+                SELECT sender_id, COALESCE(sender_name, 'Unknown'), sender_username,
+                       MIN(created_at), MAX(created_at), COUNT(*)
+                FROM messages
+                WHERE sender_id IS NOT NULL
+                GROUP BY sender_id
+                """
+            )
+        except Exception:
+            pass
+
         # Indexes for fast lookup on message deletion and edits
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_msg ON messages(chat_id, message_id)"
@@ -82,6 +116,7 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_conn ON messages(business_connection_id)"
         )
         conn.commit()
+
 
 
 def save_or_update_connection(
@@ -263,11 +298,19 @@ def get_stats() -> Dict[str, int]:
         cursor.execute("SELECT COUNT(*) FROM business_connections WHERE is_enabled = 1")
         active_connections = cursor.fetchone()[0]
 
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM users WHERE is_blocked = 1")
+        total_blocked = cursor.fetchone()[0]
+
         return {
             "total_messages": total_messages,
             "total_deleted": total_deleted,
             "total_edits": total_edits,
             "active_connections": active_connections,
+            "total_users": total_users,
+            "total_blocked": total_blocked,
         }
 
 
@@ -300,4 +343,114 @@ def get_recent_messages(limit: int = 10) -> List[Dict[str, Any]]:
             (limit,),
         )
         return [dict(r) for r in cursor.fetchall()]
+
+
+# ── User Management ───────────────────────────────────────────────────────────
+def record_user(
+    user_id: int,
+    full_name: str,
+    username: Optional[str] = None,
+    is_admin: bool = False,
+) -> None:
+    """Record or update a user activity in the database."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, full_name, username, is_admin, first_seen, last_seen, total_messages)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id) DO UPDATE SET
+                full_name = excluded.full_name,
+                username = COALESCE(excluded.username, users.username),
+                last_seen = excluded.last_seen,
+                total_messages = users.total_messages + 1
+            """,
+            (user_id, full_name or "Unknown", username, 1 if is_admin else 0, now, now),
+        )
+        conn.commit()
+
+
+def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    """Get single user profile by user_id."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def is_user_blocked(user_id: int) -> bool:
+    """Check if a user is blocked."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_blocked FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        return bool(row and row[0] == 1)
+
+
+def block_user(user_id: int) -> bool:
+    """Block a user from using the bot or being tracked."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO users (user_id, full_name, username, is_blocked, first_seen, last_seen, total_messages)
+            VALUES (?, 'Blocked User', NULL, 1, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET is_blocked = 1
+            """,
+            (user_id, now, now),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def unblock_user(user_id: int) -> bool:
+    """Unblock a user."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET is_blocked = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_users_paginated(page: int = 1, per_page: int = 6) -> tuple[List[Dict[str, Any]], int, int]:
+    """Retrieve users with pagination. Returns (users_list, total_count, total_pages)."""
+    offset = max(0, (page - 1) * per_page)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_count = cursor.fetchone()[0]
+        total_pages = max(1, (total_count + per_page - 1) // per_page)
+
+        cursor.execute(
+            """
+            SELECT * FROM users
+            ORDER BY last_seen DESC
+            LIMIT ? OFFSET ?
+            """,
+            (per_page, offset),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        return rows, total_count, total_pages
+
+
+def get_blocked_users(limit: int = 20) -> List[Dict[str, Any]]:
+    """Retrieve list of currently blocked users."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM users
+            WHERE is_blocked = 1
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
 
