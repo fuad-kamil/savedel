@@ -445,8 +445,34 @@ def get_message_by_db_id(db_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def get_all_linked_media_records(db_id: int) -> List[Dict[str, Any]]:
+    """Get all linked media records sharing the same db_id, chat_id + message_id, or cloud_url."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM messages WHERE id = ?", (db_id,))
+        row = cursor.fetchone()
+        if not row:
+            return []
+        item = dict(row)
+        cid = item.get("chat_id")
+        mid = item.get("message_id")
+        curl = item.get("cloud_url")
+
+        cursor.execute(
+            """
+            SELECT id, media_type, local_path, cloud_url, cloudinary_public_id, chat_id, message_id
+            FROM messages
+            WHERE id = ?
+               OR (chat_id = ? AND message_id = ?)
+               OR (? IS NOT NULL AND cloud_url = ?)
+            """,
+            (db_id, cid, mid, curl, curl),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
 def purge_media_record(db_id: int) -> Optional[Dict[str, Any]]:
-    """Clear media fields (local_path, media_file_id, cloud_url, cloudinary_public_id) from message record."""
+    """Clear media fields (local_path, media_file_id, cloud_url, cloudinary_public_id) from message record and all duplicate linked rows."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM messages WHERE id = ?", (db_id,))
@@ -454,6 +480,10 @@ def purge_media_record(db_id: int) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         item = dict(row)
+        cid = item.get("chat_id")
+        mid = item.get("message_id")
+        curl = item.get("cloud_url")
+
         cursor.execute(
             """
             UPDATE messages
@@ -462,8 +492,10 @@ def purge_media_record(db_id: int) -> Optional[Dict[str, Any]]:
                 cloudinary_public_id = NULL,
                 media_file_id = NULL
             WHERE id = ?
+               OR (chat_id = ? AND message_id = ?)
+               OR (? IS NOT NULL AND cloud_url = ?)
             """,
-            (db_id,),
+            (db_id, cid, mid, curl, curl),
         )
         conn.commit()
         return item

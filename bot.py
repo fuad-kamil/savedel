@@ -56,13 +56,28 @@ except ImportError:
     CLOUDINARY_AVAILABLE = False
 
 
-def upload_to_cloudinary(local_path: Optional[str], mtype: str) -> tuple[Optional[str], Optional[str]]:
-    """Upload media file to Cloudinary if configured. Returns (secure_url, public_id)."""
+def upload_to_cloudinary(
+    local_path: Optional[str],
+    mtype: str,
+    chat_id: Optional[int] = None,
+    msg_id: Optional[int] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Upload media file to Cloudinary if configured.
+    Uses deterministic public_id (tg_{chat_id}_{msg_id}) with overwrite=True
+    to guarantee no duplicate assets are ever created in Cloudinary.
+    """
     if not CLOUDINARY_AVAILABLE or not CLOUDINARY_URL or not local_path or not os.path.exists(local_path):
         return None, None
     try:
         rtype = "video" if mtype in ("video", "voice", "audio", "video_note") else ("image" if mtype in ("photo", "sticker") else "auto")
-        res = cloudinary.uploader.upload(local_path, resource_type=rtype)
+        upload_kwargs: dict[str, Any] = {"resource_type": rtype}
+        if chat_id is not None and msg_id is not None:
+            upload_kwargs["public_id"] = f"tg_{abs(chat_id)}_{msg_id}"
+            upload_kwargs["overwrite"] = True
+            upload_kwargs["unique_filename"] = False
+
+        res = cloudinary.uploader.upload(local_path, **upload_kwargs)
         url = res.get("secure_url")
         pid = res.get("public_id")
         logger.info(f"  [CLOUDINARY] Uploaded {mtype} pid={pid} => {url}")
@@ -88,21 +103,52 @@ def extract_cloudinary_public_id(cloud_url: Optional[str]) -> Optional[str]:
         return None
 
 
-def delete_from_cloudinary(public_id: Optional[str], cloud_url: Optional[str], mtype: str) -> bool:
-    """Delete a media asset from Cloudinary using public_id or cloud_url."""
+def delete_from_cloudinary(
+    public_id: Optional[str] = None,
+    cloud_url: Optional[str] = None,
+    mtype: str = "auto",
+    chat_id: Optional[int] = None,
+    msg_id: Optional[int] = None,
+) -> bool:
+    """
+    Delete a media asset from Cloudinary using public_id, cloud_url, or chat+msg ID.
+    Attempts deletion across multiple resource types (image, video, raw) and candidate IDs
+    so no duplicate or orphaned copies are left behind in Cloudinary.
+    """
     if not CLOUDINARY_AVAILABLE or not CLOUDINARY_URL:
         return False
-    pid = public_id or extract_cloudinary_public_id(cloud_url)
-    if not pid:
+
+    candidate_pids = set()
+    if public_id:
+        candidate_pids.add(public_id)
+    url_pid = extract_cloudinary_public_id(cloud_url)
+    if url_pid:
+        candidate_pids.add(url_pid)
+    if chat_id is not None and msg_id is not None:
+        candidate_pids.add(f"tg_{abs(chat_id)}_{msg_id}")
+
+    if not candidate_pids:
         return False
-    try:
-        rtype = "video" if mtype in ("video", "voice", "audio", "video_note") else ("image" if mtype in ("photo", "sticker") else "raw")
-        res = cloudinary.uploader.destroy(pid, resource_type=rtype)
-        logger.info(f"  [CLOUDINARY DESTROY] pid={pid} rtype={rtype} res={res}")
-        return res.get("result") in ("ok", "not found")
-    except Exception as e:
-        logger.warning(f"  [CLOUDINARY DESTROY FAIL] {e}")
-        return False
+
+    success = False
+    resource_types = ["image", "video", "raw"]
+    primary_rtype = "video" if mtype in ("video", "voice", "audio", "video_note") else ("image" if mtype in ("photo", "sticker") else "raw")
+    if primary_rtype in resource_types:
+        resource_types.remove(primary_rtype)
+        resource_types.insert(0, primary_rtype)
+
+    for pid in candidate_pids:
+        for rtype in resource_types:
+            try:
+                res = cloudinary.uploader.destroy(pid, resource_type=rtype)
+                logger.info(f"  [CLOUDINARY DESTROY] pid={pid} rtype={rtype} res={res}")
+                if res.get("result") in ("ok", "not found"):
+                    if res.get("result") == "ok":
+                        success = True
+            except Exception as e:
+                logger.warning(f"  [CLOUDINARY DESTROY FAIL] pid={pid} rtype={rtype}: {e}")
+
+    return success
 
 
 def is_admin(user_id: Optional[int]) -> bool:
@@ -310,6 +356,11 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
     if s and getattr(s, "id", None):
         database.record_user(s.id, s.full_name or "Unknown", s.username)
 
+    existing = database.get_message(chat_id, msg_id)
+    if existing and existing.get("cloud_url") and existing.get("cloudinary_public_id"):
+        logger.info(f"  [MSG CACHED] chat={chat_id} id={msg_id} already saved in DB & Cloudinary")
+        return existing.get("local_path")
+
     mt, fid = extract_media(obj)
     is_timed = bool(
         getattr(obj, "ttl_period", None) or
@@ -320,7 +371,7 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         f"from='{s.full_name if s else '?'}' type={mt or 'text'}{' [TIMED]' if is_timed else ''}"
     )
     lp = await dl(ctx, fid, mt, chat_id, msg_id) if (mt and fid) else None
-    curl, cpid = upload_to_cloudinary(lp, mt) if (lp and mt) else (None, None)
+    curl, cpid = upload_to_cloudinary(lp, mt, chat_id=chat_id, msg_id=msg_id) if (lp and mt) else (None, None)
     database.save_message(
         business_connection_id=conn_id,
         chat_id=chat_id, message_id=msg_id,
@@ -417,39 +468,45 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not (rtype and rfid and rmid):
             continue
 
-        # Skip if already saved to disk
+        # Check if already captured in DB / Cloudinary
         existing = database.get_message(cid, rmid)
-        if existing and existing.get("local_path") and os.path.exists(
-                existing["local_path"]):
-            logger.info(f"  [SKIP] timed msg {rmid} already on disk")
-            continue
+        if existing and existing.get("cloud_url"):
+            logger.info(f"  [SKIP TIMED UPLOAD] timed msg {rmid} already uploaded: {existing.get('cloud_url')}")
+            rcurl = existing.get("cloud_url")
+            rcpid = existing.get("cloudinary_public_id")
+            rpath = existing.get("local_path")
+        elif existing and existing.get("local_path") and os.path.exists(existing["local_path"]):
+            rpath = existing["local_path"]
+            rcurl, rcpid = upload_to_cloudinary(rpath, rtype, chat_id=cid, msg_id=rmid)
+            database.save_message(
+                business_connection_id=conn,
+                chat_id=cid, message_id=rmid,
+                sender_id=existing.get("sender_id"),
+                sender_name=existing.get("sender_name") or "Unknown",
+                sender_username=existing.get("sender_username"),
+                text=None, media_type=rtype, media_file_id=rfid,
+                caption=existing.get("caption"), created_at=existing.get("created_at") or date,
+                local_path=rpath, is_timed=True,
+                cloud_url=rcurl, cloudinary_public_id=rcpid,
+            )
+        else:
+            logger.info(f"  [TIMED] capturing {rtype} msg_id={rmid} from {rname}")
+            rpath, effective_fid = await dl_media_obj(ctx, replied, rtype, cid, rmid)
+            rfid = effective_fid or rfid
+            rcurl, rcpid = upload_to_cloudinary(rpath, rtype, chat_id=cid, msg_id=rmid) if (rpath and rtype) else (None, None)
 
-        rs    = getattr(replied, "from_user", None)
-        rname = rs.full_name if rs else "Unknown"
-        rcap  = getattr(replied, "caption", None) or getattr(replied, "text", None)
-        rdate = (
-            replied.date.isoformat()
-            if hasattr(replied, "date") and replied.date
-            else date
-        )
-
-        logger.info(f"  [TIMED] capturing {rtype} msg_id={rmid} from {rname}")
-        rpath, effective_fid = await dl_media_obj(ctx, replied, rtype, cid, rmid)
-        rfid = effective_fid or rfid
-        rcurl, rcpid = upload_to_cloudinary(rpath, rtype) if (rpath and rtype) else (None, None)
-
-        database.save_message(
-            business_connection_id=conn,
-            chat_id=cid, message_id=rmid,
-            sender_id=rs.id if rs else None,
-            sender_name=rname,
-            sender_username=rs.username if rs else None,
-            text=None, media_type=rtype, media_file_id=rfid,
-            caption=rcap, created_at=rdate, local_path=rpath,
-            is_timed=True,
-            cloud_url=rcurl,
-            cloudinary_public_id=rcpid,
-        )
+            database.save_message(
+                business_connection_id=conn,
+                chat_id=cid, message_id=rmid,
+                sender_id=rs.id if rs else None,
+                sender_name=rname,
+                sender_username=rs.username if rs else None,
+                text=None, media_type=rtype, media_file_id=rfid,
+                caption=rcap, created_at=rdate, local_path=rpath,
+                is_timed=True,
+                cloud_url=rcurl,
+                cloudinary_public_id=rcpid,
+            )
 
         oid = await get_owner(ctx, conn)
         if not oid:
@@ -535,7 +592,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     f"📦 <b>Type:</b> <code>{rtype}</code>{body}\n\n"
                     f"<i>Note: If media is view-once encrypted, view it in chat before expiration.</i>"
                 ),
-                reply_markup=reply_markup,
             )
 
 
@@ -996,24 +1052,34 @@ async def cmd_purge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not item:
         await update.message.reply_text("❌ Record not found in database.", parse_mode=ParseMode.HTML)
         return
-    mtype = item.get("media_type") or "media"
-    pid   = item.get("cloudinary_public_id")
-    curl  = item.get("cloud_url")
-    lpath = item.get("local_path")
 
-    c_res = delete_from_cloudinary(pid, curl, mtype)
-    if lpath and os.path.exists(lpath):
-        try:
-            os.remove(lpath)
-        except Exception:
-            pass
+    linked = database.get_all_linked_media_records(db_id)
+    if not linked and item:
+        linked = [item]
+
+    c_res = False
+    for rec in linked:
+        mtype = rec.get("media_type") or "media"
+        pid   = rec.get("cloudinary_public_id")
+        curl  = rec.get("cloud_url")
+        lpath = rec.get("local_path")
+        cid   = rec.get("chat_id")
+        mid   = rec.get("message_id")
+        if delete_from_cloudinary(pid, curl, mtype, chat_id=cid, msg_id=mid):
+            c_res = True
+        if lpath and os.path.exists(lpath):
+            try:
+                os.remove(lpath)
+            except Exception:
+                pass
+
     database.purge_media_record(db_id)
 
     status_msg = "Cloudinary cloud storage and local database" if c_res else "Local bot database"
     await update.message.reply_text(
         f"🗑️ <b>Media Purged Successfully!</b>\n\n"
         f"Record ID: <code>{db_id}</code>\n"
-        f"Type: <code>{mtype}</code>\n"
+        f"Type: <code>{item.get('media_type') or 'media'}</code>\n"
         f"Purged from: <b>{status_msg}</b>",
         parse_mode=ParseMode.HTML
     )
@@ -1224,17 +1290,26 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 await query.answer("Record not found in database.", show_alert=True)
                 return
 
-            mtype = item.get("media_type") or "media"
-            pid   = item.get("cloudinary_public_id")
-            curl  = item.get("cloud_url")
-            lpath = item.get("local_path")
+            linked = database.get_all_linked_media_records(db_id)
+            if not linked and item:
+                linked = [item]
 
-            c_res = delete_from_cloudinary(pid, curl, mtype)
-            if lpath and os.path.exists(lpath):
-                try:
-                    os.remove(lpath)
-                except Exception:
-                    pass
+            c_res = False
+            for rec in linked:
+                mtype = rec.get("media_type") or "media"
+                pid   = rec.get("cloudinary_public_id")
+                curl  = rec.get("cloud_url")
+                lpath = rec.get("local_path")
+                cid   = rec.get("chat_id")
+                mid   = rec.get("message_id")
+                if delete_from_cloudinary(pid, curl, mtype, chat_id=cid, msg_id=mid):
+                    c_res = True
+                if lpath and os.path.exists(lpath):
+                    try:
+                        os.remove(lpath)
+                    except Exception:
+                        pass
+
             database.purge_media_record(db_id)
 
             where_str = "Cloudinary & Bot" if c_res else "Bot storage"
@@ -1277,6 +1352,7 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     logger.info(f"[DIRECT PM] from='{sname}' chat={cid} type={mt or 'text'}")
 
     lp = await dl(ctx, fid, mt, cid, mid) if (mt and fid) else None
+    curl, cpid = upload_to_cloudinary(lp, mt, chat_id=cid, msg_id=mid) if (lp and mt) else (None, None)
     database.save_message(
         business_connection_id="direct",
         chat_id=cid, message_id=mid,
@@ -1287,6 +1363,8 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         media_type=mt, media_file_id=fid,
         caption=msg.caption,
         created_at=date, local_path=lp,
+        cloud_url=curl,
+        cloudinary_public_id=cpid,
     )
 
     if mt and lp:
