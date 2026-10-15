@@ -11,7 +11,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-import os, html, logging, atexit, threading, asyncio
+import os, html, logging, atexit, threading, asyncio, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Any
 from dotenv import load_dotenv
@@ -203,38 +203,61 @@ def get_reply_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 
+_recent_alerts: dict[str, float] = {}
+
+def is_duplicate_alert(alert_key: str, cooldown_seconds: float = 4.0) -> bool:
+    """Return True if this exact alert key was triggered within the cooldown window."""
+    now = time.time()
+    for k in list(_recent_alerts.keys()):
+        if now - _recent_alerts[k] > 60.0:
+            _recent_alerts.pop(k, None)
+    last_time = _recent_alerts.get(alert_key)
+    if last_time and (now - last_time) < cooldown_seconds:
+        return True
+    _recent_alerts[alert_key] = now
+    return False
+
+
 def get_admin_notification_targets() -> set[int]:
-    """Retrieve all admin and active business owner IDs to receive operational notifications."""
-    targets = set(ADMIN_IDS)
-    try:
-        if FALLBACK_OWNER and str(FALLBACK_OWNER).lstrip("-").isdigit():
-            targets.add(int(FALLBACK_OWNER))
-    except Exception:
-        pass
+    """Retrieve unique admin and active business owner IDs to receive operational notifications."""
+    targets: set[int] = set()
+    for aid in ADMIN_IDS:
+        targets.add(int(aid))
+    if FALLBACK_OWNER and str(FALLBACK_OWNER).lstrip("-").isdigit():
+        targets.add(int(FALLBACK_OWNER))
     try:
         for uid in database.get_admin_user_ids():
-            targets.add(uid)
+            targets.add(int(uid))
     except Exception:
         pass
-    try:
-        for conn in database.get_active_connections():
-            uid = conn.get("user_chat_id")
-            if uid:
-                targets.add(uid)
-    except Exception:
-        pass
+    # If no explicit admin IDs configured in .env, fall back to active connection owners
+    if not targets:
+        try:
+            for conn in database.get_active_connections():
+                uid = conn.get("user_chat_id")
+                if uid:
+                    targets.add(int(uid))
+        except Exception:
+            pass
     return targets
 
 
 async def notify_admins(
     ctx: ContextTypes.DEFAULT_TYPE,
     text: str,
-    exclude_id: Optional[int] = None,
+    exclude_id: Optional[Any] = None,
 ) -> None:
     """Deliver an operational notification to all admins and owners."""
+    exclude_int = None
+    if exclude_id is not None:
+        try:
+            exclude_int = int(exclude_id)
+        except (ValueError, TypeError):
+            exclude_int = None
+
     targets = get_admin_notification_targets()
     for tid in targets:
-        if exclude_id and tid == exclude_id:
+        if exclude_int is not None and int(tid) == exclude_int:
             continue
         try:
             await ctx.bot.send_message(
@@ -554,12 +577,18 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await cache_msg(ctx, msg, conn, cid, mid, date)
 
     # 2. Timed / View-Once interception
+    seen_rmids: set[int] = set()
     for replied in (msg.reply_to_message, msg.external_reply):
         if not replied:
             continue
         rtype, rfid = extract_media(replied)
         rmid = getattr(replied, "message_id", None)
         if not (rtype and rfid and rmid):
+            continue
+        if rmid in seen_rmids:
+            continue
+        seen_rmids.add(rmid)
+        if is_duplicate_alert(f"timed_{cid}_{rmid}"):
             continue
 
         rs    = getattr(replied, "from_user", None)
@@ -611,12 +640,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         runame = f"@{rs.username}" if (rs and rs.username) else "None"
 
         header = (
-            f"⏱️ <b>Timed / View-Once Media Captured!</b>\n\n"
-            f"👤 <b>Sender:</b> {esc(rname)} ({esc(runame)})\n"
+            f"🔔 <b>Admin Notification: Timed Media Saved</b>\n\n"
+            f"👤 <b>From:</b> {esc(rname)} ({esc(runame)})\n"
             f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
-            f"💬 <b>Chat:</b> {esc(cname)}\n"
-            f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+            f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
             f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
+            f"⚙️ <b>Change Type:</b> ⏱️ <code>Timed / View-Once Media Saved</code>\n"
             f"📦 <b>Type:</b> <code>{rtype}</code>\n"
             f"<i>Saved before it expires!</i>"
         )
@@ -694,25 +723,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 ),
             )
 
-        admin_timed_alert = (
-            f"🔔 <b>Admin Notification: Timed Media Saved</b>\n\n"
-            f"👤 <b>From:</b> {esc(rname)} ({esc(runame)})\n"
-            f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
-            f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
-            f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
-            f"⚙️ <b>Change Type:</b> ⏱️ <code>Timed / View-Once Media Saved</code>\n"
-            f"📦 <b>Media Type:</b> <code>{rtype}</code>\n"
-            + (f"📝 <b>Caption:</b> <blockquote>{esc(rcap)}</blockquote>\n" if rcap else "") +
-            f"🕒 <b>Status:</b> Intercepted & cached in storage!"
-        )
-        await notify_admins(ctx, admin_timed_alert, exclude_id=oid)
-
-
 async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.edited_business_message
     if not msg:
         return
     cid, mid, conn = msg.chat.id, msg.message_id, msg.business_connection_id
+    if is_duplicate_alert(f"edit_{cid}_{mid}"):
+        return
+
     new   = msg.text or msg.caption or "[media]"
     old_d = database.record_message_edit(cid, mid, new)
     oid   = await get_owner(ctx, conn)
@@ -724,22 +742,6 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cn   = msg.chat.title or msg.chat.first_name or str(cid)
     old  = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
 
-    edit_notice = (
-        f"✏️ <b>Message Edited!</b>\n\n"
-        f"👤 <b>Sender:</b> {esc(sn)} ({esc(un)})\n"
-        f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
-        f"💬 <b>Chat:</b> {esc(cn)}\n"
-        f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
-        f"🔢 <b>Message ID:</b> <code>{mid}</code>\n\n"
-        f"<b>Before:</b>\n<blockquote>{esc(old)}</blockquote>\n\n"
-        f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
-    )
-
-    try:
-        await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=edit_notice)
-    except Exception as e:
-        logger.error(f"[EDIT NOTIFY] {e}")
-
     admin_edit_alert = (
         f"🔔 <b>Admin Notification: Message Edited</b>\n\n"
         f"👤 <b>From:</b> {esc(sn)} ({esc(un)})\n"
@@ -750,6 +752,12 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"<b>Before:</b>\n<blockquote>{esc(old)}</blockquote>\n\n"
         f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
     )
+
+    try:
+        await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=admin_edit_alert)
+    except Exception as e:
+        logger.error(f"[EDIT NOTIFY] {e}")
+
     await notify_admins(ctx, admin_edit_alert, exclude_id=oid)
 
 
@@ -770,21 +778,6 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not recovered:
-        try:
-            await ctx.bot.send_message(
-                chat_id=oid, parse_mode=ParseMode.HTML,
-                text=(
-                    f"🗑️ <b>Deletion Detected</b>\n\n"
-                    f"💬 <b>Chat:</b> {esc(cname)}\n"
-                    f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
-                    f"🔢 <b>Deleted Message IDs:</b> <code>{ids}</code>\n\n"
-                    f"<i>{len(ids)} message(s) deleted — not cached "
-                    f"(they were sent before the bot started).</i>"
-                )
-            )
-        except Exception as e:
-            logger.error(f"[DELETE NOTICE] {e}")
-
         untracked_alert = (
             f"🔔 <b>Admin Notification: Deletion Detected</b>\n\n"
             f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
@@ -792,10 +785,18 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"⚙️ <b>Change Type:</b> 🗑️ <code>Untracked Message Deleted</code>\n"
             f"<i>{len(ids)} message(s) deleted before the bot started.</i>"
         )
+        try:
+            await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=untracked_alert)
+        except Exception as e:
+            logger.error(f"[DELETE NOTICE] {e}")
         await notify_admins(ctx, untracked_alert, exclude_id=oid)
         return
 
     for item in recovered:
+        mid = item.get("message_id")
+        if is_duplicate_alert(f"del_{cid}_{mid}"):
+            continue
+
         sn   = item.get("sender_name") or "Unknown"
         sid  = item.get("sender_id") or "Unknown"
         un   = f"@{item['sender_username']}" if item.get("sender_username") else "None"
@@ -804,22 +805,20 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         mt   = item.get("media_type")
         fid  = item.get("media_file_id")
         lp   = item.get("local_path")
-        mid  = item.get("message_id")
         is_timed_msg = bool(item.get("is_timed"))
-        title_hdr = "⏱️ <b>Timed Media Expired / Deleted!</b>" if is_timed_msg else "🗑️ <b>Deleted Message Recovered!</b>"
+        del_change_type = "⏱️ Timed Media Expired / Deleted" if is_timed_msg else "🗑️ Deleted Message Recovered"
         timed_badge = " ⏱️ <i>[View-Once Expired]</i>" if is_timed_msg else ""
         hdr  = (
-            f"{title_hdr}\n\n"
-            f"👤 <b>Sender:</b> {esc(sn)} ({esc(un)})\n"
+            f"🔔 <b>Admin Notification: {del_change_type}</b>\n\n"
+            f"👤 <b>From:</b> {esc(sn)} ({esc(un)})\n"
             f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
-            f"💬 <b>Chat:</b> {esc(cname)}\n"
-            f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+            f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
             f"🔢 <b>Message ID:</b> <code>{mid}</code>\n"
+            f"⚙️ <b>Change Type:</b> <code>{del_change_type}</code>\n"
             f"📦 <b>Type:</b> <code>{mt or 'text'}</code>{timed_badge}\n"
             f"📅 <b>Sent At:</b> <code>{st} UTC</code>"
         )
         body = f"\n\n📝 <b>Content:</b>\n<blockquote>{esc(tb)}</blockquote>" if tb else ""
-
         curl = item.get("cloud_url")
 
         try:
@@ -832,20 +831,6 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
         except Exception as e:
             logger.error(f"[RECOVERED SEND] {e}")
-
-        del_change_type = "⏱️ Timed Media Expired / Deleted" if is_timed_msg else "🗑️ Message Deleted & Recovered"
-        del_alert = (
-            f"🔔 <b>Admin Notification: {del_change_type}</b>\n\n"
-            f"👤 <b>From:</b> {esc(sn)} ({esc(un)})\n"
-            f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
-            f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
-            f"🔢 <b>Message ID:</b> <code>{mid}</code>\n"
-            f"⚙️ <b>Change Type:</b> <code>{del_change_type}</code>\n"
-            f"📦 <b>Type:</b> <code>{mt or 'text'}</code>\n"
-            + (f"📝 <b>Content:</b> <blockquote>{esc(tb)}</blockquote>\n" if tb else "") +
-            f"📅 <b>Sent At:</b> <code>{st} UTC</code>"
-        )
-        await notify_admins(ctx, del_alert, exclude_id=oid)
 
 
 # ── Admin Dashboard Builders ──────────────────────────────────────────────────
@@ -1666,6 +1651,8 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     cid = msg.chat.id
     mid = msg.message_id
+    if is_duplicate_alert(f"direct_{cid}_{mid}"):
+        return
     date = msg.date.isoformat()
     mt, fid = extract_media(msg)
     sname = s.full_name if s else "Unknown"
