@@ -69,11 +69,31 @@ Send these commands directly to your bot in private chat:
 * `/start` - Setup instructions and connection status
 * `/status` - Live statistics (cached messages, recovered deletions, logged edits)
 * `/recent` - View the last 5 recovered deleted messages
+* `/saved` - View saved user vault messages (both user messages and receiver replies)
+* `/admin` - Open the interactive Administrator Control Panel
 * `/help` - FAQ and troubleshooting
 
 ---
 
+## 🚀 Persistent Start Menu & Instant Actions
+* **Integrated Native Chat Menu Button**: Telegram commands and menu button are automatically registered with `set_chat_menu_button` and `set_my_commands`.
+* **Persistent Bottom Reply Keyboard**: Users and Admins never have to type `/start` manually. Quick buttons (`🚀 Start / Menu`, `💾 My Saved Messages`, `👑 Admin Dashboard`, `📊 System Status`) are permanently docked at the bottom of the chat.
+
+---
+
+## 🔔 Admin Activity Notifications
+Whenever users interact with the bot or changes occur across chats, a structured alert is dispatched to administrators detailing:
+1. **To Whom It Is Sent / Recipient**: Target chat name or bot handle with chat ID.
+2. **From Whom It Was Sent**: Sender's full name, username, and Telegram user ID.
+3. **Change Type & Action**:
+   - ⏱️ `Timed / View-Once Media Saved`
+   - ✏️ `Message Content Edited` (with before/after diff)
+   - 🗑️ `Deleted Message Recovered` / `Media Purged`
+   - 💾 `Direct User Message / Media Saved`
+4. **Content Preview & Timestamp**: Message snippets and exact UTC timestamp.
+
+---
+
 ## 🔒 Privacy & Storage
-* All messages are stored locally on your machine in `anti_delete.db` (SQLite).
-* No data is sent to third-party cloud services or servers.
-* Deleted media (photos, voice notes, videos) are preserved via Telegram's `file_id` without eating up your hard drive space.
+* All messages are stored in `anti_delete.db` (SQLite) and backed up to Cloudinary cloud storage.
+* Non-blocking background threads ensure media uploads never lag the Telegram bot.

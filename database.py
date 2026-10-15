@@ -186,6 +186,22 @@ def get_active_connection_by_user(user_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def get_active_connections() -> List[Dict[str, Any]]:
+    """Retrieve all active business connections."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM business_connections WHERE is_enabled = 1")
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def get_admin_user_ids() -> List[int]:
+    """Retrieve all user IDs marked as admin in the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE is_admin = 1")
+        return [r["user_id"] for r in cursor.fetchall()]
+
+
 def save_message(
     business_connection_id: str,
     chat_id: int,

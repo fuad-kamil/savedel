@@ -15,7 +15,10 @@ import os, html, logging, atexit, threading, asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Any
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand, MenuButtonCommands,
+)
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -175,9 +178,88 @@ def is_admin(user_id: Optional[int]) -> bool:
             return True
     except (ValueError, TypeError):
         pass
+    # Check if marked admin in users DB
+    try:
+        if user_id in database.get_admin_user_ids():
+            return True
+    except Exception:
+        pass
     # Owners of an active Telegram Business connection are automatically admins
     conn = database.get_active_connection_by_user(user_id)
     return bool(conn)
+
+
+def get_reply_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
+    """Return persistent bottom reply keyboard so users and admins never have to type /start manually."""
+    if admin:
+        keyboard = [
+            [KeyboardButton("🚀 Start / Menu"), KeyboardButton("👑 Admin Dashboard")],
+            [KeyboardButton("💾 Saved Messages"), KeyboardButton("📊 System Status")],
+        ]
+    else:
+        keyboard = [
+            [KeyboardButton("🚀 Start / Menu"), KeyboardButton("💾 My Saved Messages")],
+        ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+
+def get_admin_notification_targets() -> set[int]:
+    """Retrieve all admin and active business owner IDs to receive operational notifications."""
+    targets = set(ADMIN_IDS)
+    try:
+        if FALLBACK_OWNER and str(FALLBACK_OWNER).lstrip("-").isdigit():
+            targets.add(int(FALLBACK_OWNER))
+    except Exception:
+        pass
+    try:
+        for uid in database.get_admin_user_ids():
+            targets.add(uid)
+    except Exception:
+        pass
+    try:
+        for conn in database.get_active_connections():
+            uid = conn.get("user_chat_id")
+            if uid:
+                targets.add(uid)
+    except Exception:
+        pass
+    return targets
+
+
+async def notify_admins(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    exclude_id: Optional[int] = None,
+) -> None:
+    """Deliver an operational notification to all admins and owners."""
+    targets = get_admin_notification_targets()
+    for tid in targets:
+        if exclude_id and tid == exclude_id:
+            continue
+        try:
+            await ctx.bot.send_message(
+                chat_id=tid,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning(f"[ADMIN NOTIFY FAIL] to={tid}: {e}")
+
+
+async def post_init(application: Any) -> None:
+    """Register persistent Telegram commands and chat menu button."""
+    try:
+        commands = [
+            BotCommand("start", "🚀 Start / Main Menu"),
+            BotCommand("saved", "💾 My Saved Messages"),
+            BotCommand("status", "📊 System Status"),
+            BotCommand("admin", "👑 Admin Dashboard"),
+        ]
+        await application.bot.set_my_commands(commands)
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logger.info("[INIT] Registered bot commands and persistent Chat Menu button")
+    except Exception as e:
+        logger.warning(f"[INIT] Could not set bot menu commands: {e}")
 
 
 
@@ -612,6 +694,19 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 ),
             )
 
+        admin_timed_alert = (
+            f"🔔 <b>Admin Notification: Timed Media Saved</b>\n\n"
+            f"👤 <b>From:</b> {esc(rname)} ({esc(runame)})\n"
+            f"🆔 <b>Sender ID:</b> <code>{rsid}</code>\n"
+            f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
+            f"🔢 <b>Message ID:</b> <code>{rmid}</code>\n"
+            f"⚙️ <b>Change Type:</b> ⏱️ <code>Timed / View-Once Media Saved</code>\n"
+            f"📦 <b>Media Type:</b> <code>{rtype}</code>\n"
+            + (f"📝 <b>Caption:</b> <blockquote>{esc(rcap)}</blockquote>\n" if rcap else "") +
+            f"🕒 <b>Status:</b> Intercepted & cached in storage!"
+        )
+        await notify_admins(ctx, admin_timed_alert, exclude_id=oid)
+
 
 async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.edited_business_message
@@ -629,22 +724,33 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cn   = msg.chat.title or msg.chat.first_name or str(cid)
     old  = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
 
+    edit_notice = (
+        f"✏️ <b>Message Edited!</b>\n\n"
+        f"👤 <b>Sender:</b> {esc(sn)} ({esc(un)})\n"
+        f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
+        f"💬 <b>Chat:</b> {esc(cn)}\n"
+        f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
+        f"🔢 <b>Message ID:</b> <code>{mid}</code>\n\n"
+        f"<b>Before:</b>\n<blockquote>{esc(old)}</blockquote>\n\n"
+        f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
+    )
+
     try:
-        await ctx.bot.send_message(
-            chat_id=oid, parse_mode=ParseMode.HTML,
-            text=(
-                f"✏️ <b>Message Edited!</b>\n\n"
-                f"👤 <b>Sender:</b> {esc(sn)} ({esc(un)})\n"
-                f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
-                f"💬 <b>Chat:</b> {esc(cn)}\n"
-                f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
-                f"🔢 <b>Message ID:</b> <code>{mid}</code>\n\n"
-                f"<b>Before:</b>\n<blockquote>{esc(old)}</blockquote>\n\n"
-                f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
-            ),
-        )
+        await ctx.bot.send_message(chat_id=oid, parse_mode=ParseMode.HTML, text=edit_notice)
     except Exception as e:
         logger.error(f"[EDIT NOTIFY] {e}")
+
+    admin_edit_alert = (
+        f"🔔 <b>Admin Notification: Message Edited</b>\n\n"
+        f"👤 <b>From:</b> {esc(sn)} ({esc(un)})\n"
+        f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
+        f"📬 <b>To / Chat:</b> {esc(cn)} (Chat ID: <code>{cid}</code>)\n"
+        f"🔢 <b>Message ID:</b> <code>{mid}</code>\n"
+        f"⚙️ <b>Change Type:</b> ✏️ <code>Message Content Edited</code>\n\n"
+        f"<b>Before:</b>\n<blockquote>{esc(old)}</blockquote>\n\n"
+        f"<b>After:</b>\n<blockquote>{esc(new)}</blockquote>"
+    )
+    await notify_admins(ctx, admin_edit_alert, exclude_id=oid)
 
 
 async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -678,6 +784,15 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception as e:
             logger.error(f"[DELETE NOTICE] {e}")
+
+        untracked_alert = (
+            f"🔔 <b>Admin Notification: Deletion Detected</b>\n\n"
+            f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
+            f"🔢 <b>Message IDs:</b> <code>{ids}</code>\n"
+            f"⚙️ <b>Change Type:</b> 🗑️ <code>Untracked Message Deleted</code>\n"
+            f"<i>{len(ids)} message(s) deleted before the bot started.</i>"
+        )
+        await notify_admins(ctx, untracked_alert, exclude_id=oid)
         return
 
     for item in recovered:
@@ -717,6 +832,20 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
         except Exception as e:
             logger.error(f"[RECOVERED SEND] {e}")
+
+        del_change_type = "⏱️ Timed Media Expired / Deleted" if is_timed_msg else "🗑️ Message Deleted & Recovered"
+        del_alert = (
+            f"🔔 <b>Admin Notification: {del_change_type}</b>\n\n"
+            f"👤 <b>From:</b> {esc(sn)} ({esc(un)})\n"
+            f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
+            f"📬 <b>To / Chat:</b> {esc(cname)} (Chat ID: <code>{cid}</code>)\n"
+            f"🔢 <b>Message ID:</b> <code>{mid}</code>\n"
+            f"⚙️ <b>Change Type:</b> <code>{del_change_type}</code>\n"
+            f"📦 <b>Type:</b> <code>{mt or 'text'}</code>\n"
+            + (f"📝 <b>Content:</b> <blockquote>{esc(tb)}</blockquote>\n" if tb else "") +
+            f"📅 <b>Sent At:</b> <code>{st} UTC</code>"
+        )
+        await notify_admins(ctx, del_alert, exclude_id=oid)
 
 
 # ── Admin Dashboard Builders ──────────────────────────────────────────────────
@@ -1044,18 +1173,20 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u:
         return
-    database.record_user(u.id, u.full_name or "Unknown", u.username)
+    admin_flag = is_admin(u.id)
+    database.record_user(u.id, u.full_name or "Unknown", u.username, is_admin=admin_flag)
 
-    if not is_admin(u.id):
+    if not admin_flag:
         fname = esc(u.first_name or u.full_name or "there")
         welcome_text = (
             f"👋 Welcome, <b>{fname}</b>!\n\n"
             f"Glad to have you here. Have a great day!"
         )
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💾 My Saved Messages", callback_data="usr_saved_1_all")
-        ]])
-        await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await update.message.reply_text(
+            welcome_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_reply_keyboard(admin=False),
+        )
         return
 
     c = database.get_active_connection_by_user(u.id)
@@ -1083,6 +1214,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("👑 Open Admin Dashboard", callback_data="adm_menu")]
     ]
 
+    await update.message.reply_text(
+        "👋 Welcome back, Admin! Quick action buttons are docked below. Tap <b>🚀 Start / Menu</b> anytime.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_reply_keyboard(admin=True),
+    )
     await update.message.reply_text(parse_mode=ParseMode.HTML, text=text, reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -1473,6 +1609,14 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             database.purge_media_record(db_id)
 
             where_str = "Cloudinary & Bot" if c_res else "Bot storage"
+            admin_purge_alert = (
+                f"🔔 <b>Admin Notification: Media Purged</b>\n\n"
+                f"👤 <b>By Admin:</b> {esc(u.full_name or 'Admin')} (ID: <code>{u.id}</code>)\n"
+                f"📬 <b>Target Chat ID:</b> <code>{item.get('chat_id')}</code> | Msg: <code>{item.get('message_id')}</code>\n"
+                f"⚙️ <b>Change Type:</b> 🗑️ <code>Media Permanently Deleted ({where_str})</code>"
+            )
+            await notify_admins(ctx, admin_purge_alert, exclude_id=u.id)
+
             await query.answer(f"Media permanently deleted from {where_str}! 🗑️", show_alert=True)
             try:
                 await query.edit_message_reply_markup(
@@ -1501,8 +1645,24 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text("⛔ <b>Access Denied:</b> You are blocked from using this bot.", parse_mode=ParseMode.HTML)
         return
 
+    # Quick Action Keyboard Button Interception (Persistent Start / Menu / Actions)
+    txt = (msg.text or "").strip()
+    if txt in ("🚀 Start / Menu", "Start", "start", "/start", "Menu", "menu", "🚀 Start"):
+        await cmd_start(update, ctx)
+        return
+    if txt in ("💾 My Saved Messages", "💾 Saved Messages", "/saved", "saved"):
+        await cmd_saved(update, ctx)
+        return
+    if txt in ("👑 Admin Dashboard", "/admin", "admin"):
+        await cmd_admin(update, ctx)
+        return
+    if txt in ("📊 System Status", "/status", "status"):
+        await cmd_status(update, ctx)
+        return
+
+    is_user_adm = is_admin(s.id if s else 0)
     if s and getattr(s, "id", None):
-        database.record_user(s.id, s.full_name or "Unknown", s.username)
+        database.record_user(s.id, s.full_name or "Unknown", s.username, is_admin=is_user_adm)
 
     cid = msg.chat.id
     mid = msg.message_id
@@ -1526,6 +1686,26 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if lp and mt:
         asyncio.create_task(bg_upload_to_cloudinary(lp, mt, cid, mid))
 
+    # Send simple notification to admin telling to whom it is sent, from whom, and what kind of change/save was made
+    bot_info = await ctx.bot.get_me()
+    bot_handle = f"@{bot_info.username}" if (bot_info and bot_info.username) else "SavedelBot"
+    change_type = f"📸 Direct Media Saved ({mt})" if mt else "💾 Direct Message Saved"
+    snippet = msg.text or msg.caption or (f"[{mt} file]" if mt else "[No content]")
+    if len(snippet) > 160:
+        snippet = snippet[:157] + "..."
+
+    admin_note = (
+        f"🔔 <b>Admin Notification: User Activity</b>\n\n"
+        f"👤 <b>From:</b> {esc(sname)} ({esc(f'@{s.username}' if (s and s.username) else 'None')})\n"
+        f"🆔 <b>Sender ID:</b> <code>{s.id if s else 'Unknown'}</code>\n"
+        f"📬 <b>To:</b> {bot_handle} (Private Chat: <code>{cid}</code>)\n"
+        f"⚙️ <b>Change Type:</b> <code>{change_type}</code>\n"
+        f"📝 <b>Content:</b> <blockquote>{esc(snippet)}</blockquote>\n"
+        f"🕒 <b>Recorded At:</b> <code>{date[:19].replace('T', ' ')} UTC</code>"
+    )
+    await notify_admins(ctx, admin_note, exclude_id=s.id if s else None)
+
+    reply_kb = get_reply_keyboard(admin=is_user_adm)
     if mt and lp:
         fname = os.path.basename(lp)
         await msg.reply_text(
@@ -1533,19 +1713,22 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             f"Type: <code>{mt}</code>\n"
             f"Saved: <code>{fname}</code>\n"
             f"Cached in database and cloud storage.\n"
-            f"View all your messages & replies anytime with /saved.",
+            f"View all your messages & replies anytime with /saved or tap <b>💾 My Saved Messages</b> below.",
             parse_mode=ParseMode.HTML,
+            reply_markup=reply_kb,
         )
     elif mt and not lp:
         await msg.reply_text(
             f"⚠️ <b>Logged</b>, but media download failed (could be restricted/too large).",
             parse_mode=ParseMode.HTML,
+            reply_markup=reply_kb,
         )
     elif msg.text:
         await msg.reply_text(
             "✅ <b>Message Saved!</b>\n\n"
-            "View all your messages & replies anytime with /saved.",
+            "View all your messages & replies anytime with /saved or tap <b>💾 My Saved Messages</b> below.",
             parse_mode=ParseMode.HTML,
+            reply_markup=reply_kb,
         )
 
 
@@ -1562,6 +1745,7 @@ def build_app():
         .request(req)
         .get_updates_request(HTTPXRequest(connect_timeout=40, read_timeout=60,
                                           write_timeout=40, pool_timeout=30))
+        .post_init(post_init)
         .build()
     )
 
