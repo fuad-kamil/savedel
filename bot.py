@@ -243,9 +243,13 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         database.record_user(s.id, s.full_name or "Unknown", s.username)
 
     mt, fid = extract_media(obj)
+    is_timed = bool(
+        getattr(obj, "ttl_period", None) or
+        (getattr(obj, "has_media_spoiler", False) and getattr(obj, "voice", None))
+    )
     logger.info(
         f"  [MSG] chat={chat_id} id={msg_id} "
-        f"from='{s.full_name if s else '?'}' type={mt or 'text'}"
+        f"from='{s.full_name if s else '?'}' type={mt or 'text'}{' [TIMED]' if is_timed else ''}"
     )
     lp = await dl(ctx, fid, mt, chat_id, msg_id) if (mt and fid) else None
     database.save_message(
@@ -258,6 +262,7 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         media_type=mt, media_file_id=fid,
         caption=getattr(obj, "caption", None),
         created_at=date_iso, local_path=lp,
+        is_timed=is_timed,
     )
     return lp
 
@@ -368,6 +373,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             sender_username=rs.username if rs else None,
             text=None, media_type=rtype, media_file_id=rfid,
             caption=rcap, created_at=rdate, local_path=rpath,
+            is_timed=True,
         )
 
         oid = await get_owner(ctx, conn)
@@ -492,13 +498,17 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         fid  = item.get("media_file_id")
         lp   = item.get("local_path")
         mid  = item.get("message_id")
+        is_timed_msg = bool(item.get("is_timed"))
+        title_hdr = "⏱️ <b>Timed Media Expired / Deleted!</b>" if is_timed_msg else "🗑️ <b>Deleted Message Recovered!</b>"
+        timed_badge = " ⏱️ <i>[View-Once Expired]</i>" if is_timed_msg else ""
         hdr  = (
-            f"🗑️ <b>Deleted Message Recovered!</b>\n\n"
+            f"{title_hdr}\n\n"
             f"👤 <b>Sender:</b> {esc(sn)} ({esc(un)})\n"
             f"🆔 <b>Sender ID:</b> <code>{sid}</code>\n"
             f"💬 <b>Chat:</b> {esc(cname)}\n"
             f"🏷️ <b>Chat ID:</b> <code>{cid}</code>\n"
             f"🔢 <b>Message ID:</b> <code>{mid}</code>\n"
+            f"📦 <b>Type:</b> <code>{mt or 'text'}</code>{timed_badge}\n"
             f"📅 <b>Sent At:</b> <code>{st} UTC</code>"
         )
         body = f"\n\n📝 <b>Content:</b>\n<blockquote>{esc(tb)}</blockquote>" if tb else ""
@@ -531,9 +541,10 @@ def make_admin_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("💾 Saved Messages",  callback_data="adm_saved"),
-            InlineKeyboardButton("🔄 Refresh",         callback_data="adm_refresh"),
+            InlineKeyboardButton("⏱️ Timed Media",     callback_data="adm_delfilter_timed"),
         ],
         [
+            InlineKeyboardButton("🔄 Refresh",         callback_data="adm_refresh"),
             InlineKeyboardButton("❌ Close Control Panel", callback_data="adm_close"),
         ]
     ])
@@ -548,6 +559,7 @@ def make_admin_dashboard_text(user: Any) -> str:
         f"👥 <b>Total Tracked Users:</b> <code>{s['total_users']}</code>\n"
         f"🚫 <b>Blocked Users:</b> <code>{s['total_blocked']}</code>\n"
         f"💾 <b>Cached Messages:</b> <code>{s['total_messages']}</code>\n"
+        f"⏱️ <b>Timed Media Saved:</b> <code>{s.get('total_timed', 0)}</code>\n"
         f"🗑️ <b>Recovered Deletions:</b> <code>{s['total_deleted']}</code>\n"
         f"✏️ <b>Recorded Edits:</b> <code>{s['total_edits']}</code>\n"
         f"🔗 <b>Active Business Connections:</b> <code>{s['active_connections']}</code>\n\n"
@@ -636,7 +648,14 @@ def format_media_badge(mtype: Optional[str]) -> str:
 
 def render_deletions_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMarkup]:
     items = database.get_recent_deletions(limit=6, filter_type=filter_type)
-    type_label = "📸 Media Only" if filter_type == "media" else ("💬 Text Only" if filter_type == "text" else "All Messages")
+    if filter_type == "media":
+        type_label = "📸 Media Only"
+    elif filter_type == "timed":
+        type_label = "⏱️ Timed Media Only"
+    elif filter_type == "text":
+        type_label = "💬 Text Only"
+    else:
+        type_label = "All Messages"
 
     lines = [f"🗑️ <b>Recent Deletions Archive</b> ({type_label})\n"]
     if not items:
@@ -650,7 +669,10 @@ def render_deletions_view(filter_type: str = "all") -> tuple[str, InlineKeyboard
         mid = it.get("message_id")
         db_id = it.get("id")
         mtype = it.get("media_type")
+        is_timed = bool(it.get("is_timed"))
         mbadge = format_media_badge(mtype)
+        if is_timed:
+            mbadge = f"⏱️ Timed {mbadge} (View-Once)"
 
         cap = it.get("caption") or it.get("text") or ""
         if cap and len(cap) > 32:
@@ -660,7 +682,8 @@ def render_deletions_view(filter_type: str = "all") -> tuple[str, InlineKeyboard
 
         if mtype:
             desc = f"<b>{mbadge}</b>" + (f': <i>"{esc(cap)}"</i>' if cap else " <i>(no caption)</i>")
-            media_buttons.append(InlineKeyboardButton(f"📥 View #{i} ({mtype})", callback_data=f"adm_getdel_{db_id}"))
+            btn_label = f"📥 View #{i} (⏱️ {mtype})" if is_timed else f"📥 View #{i} ({mtype})"
+            media_buttons.append(InlineKeyboardButton(btn_label, callback_data=f"adm_getdel_{db_id}"))
         else:
             desc = f'💬 <b>Text:</b> <i>"{esc(cap or "[Empty]")}"</i>'
 
@@ -677,6 +700,7 @@ def render_deletions_view(filter_type: str = "all") -> tuple[str, InlineKeyboard
     filter_row = [
         InlineKeyboardButton("• All •" if filter_type == "all" else "All", callback_data="adm_delfilter_all"),
         InlineKeyboardButton("• 📸 Media •" if filter_type == "media" else "📸 Media", callback_data="adm_delfilter_media"),
+        InlineKeyboardButton("• ⏱️ Timed •" if filter_type == "timed" else "⏱️ Timed", callback_data="adm_delfilter_timed"),
         InlineKeyboardButton("• 💬 Text •" if filter_type == "text" else "💬 Text", callback_data="adm_delfilter_text"),
     ]
     keyboard.append(filter_row)
@@ -687,7 +711,14 @@ def render_deletions_view(filter_type: str = "all") -> tuple[str, InlineKeyboard
 
 def render_saved_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMarkup]:
     items = database.get_recent_messages(limit=6, filter_type=filter_type)
-    type_label = "📸 Media Only" if filter_type == "media" else ("💬 Text Only" if filter_type == "text" else "All Messages")
+    if filter_type == "media":
+        type_label = "📸 Media Only"
+    elif filter_type == "timed":
+        type_label = "⏱️ Timed Media Only"
+    elif filter_type == "text":
+        type_label = "💬 Text Only"
+    else:
+        type_label = "All Messages"
 
     lines = [f"💾 <b>Cached Messages Archive</b> ({type_label})\n"]
     if not items:
@@ -701,7 +732,10 @@ def render_saved_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMark
         mid = it.get("message_id")
         db_id = it.get("id")
         mtype = it.get("media_type")
+        is_timed = bool(it.get("is_timed"))
         mbadge = format_media_badge(mtype)
+        if is_timed:
+            mbadge = f"⏱️ Timed {mbadge} (View-Once)"
 
         cap = it.get("caption") or it.get("text") or ""
         if cap and len(cap) > 32:
@@ -711,7 +745,8 @@ def render_saved_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMark
 
         if mtype:
             desc = f"<b>{mbadge}</b>" + (f': <i>"{esc(cap)}"</i>' if cap else " <i>(no caption)</i>")
-            media_buttons.append(InlineKeyboardButton(f"📥 View #{i} ({mtype})", callback_data=f"adm_getsaved_{db_id}"))
+            btn_label = f"📥 View #{i} (⏱️ {mtype})" if is_timed else f"📥 View #{i} ({mtype})"
+            media_buttons.append(InlineKeyboardButton(btn_label, callback_data=f"adm_getsaved_{db_id}"))
         else:
             desc = f'💬 <b>Text:</b> <i>"{esc(cap or "[Empty]")}"</i>'
 
@@ -728,6 +763,7 @@ def render_saved_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMark
     filter_row = [
         InlineKeyboardButton("• All •" if filter_type == "all" else "All", callback_data="adm_savedfilter_all"),
         InlineKeyboardButton("• 📸 Media •" if filter_type == "media" else "📸 Media", callback_data="adm_savedfilter_media"),
+        InlineKeyboardButton("• ⏱️ Timed •" if filter_type == "timed" else "⏱️ Timed", callback_data="adm_savedfilter_timed"),
         InlineKeyboardButton("• 💬 Text •" if filter_type == "text" else "💬 Text", callback_data="adm_savedfilter_text"),
     ]
     keyboard.append(filter_row)
@@ -939,6 +975,7 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         text = (
             f"📊 <b>Detailed System Statistics</b>\n\n"
             f"💬 <b>Total Messages Cached:</b> <code>{s['total_messages']}</code>\n"
+            f"⏱️ <b>Timed Media Captured:</b> <code>{s.get('total_timed', 0)}</code>\n"
             f"🗑️ <b>Deleted Messages Recovered:</b> <code>{s['total_deleted']}</code>\n"
             f"✏️ <b>Message Edits Logged:</b> <code>{s['total_edits']}</code>\n"
             f"👥 <b>Total Tracked Users:</b> <code>{s['total_users']}</code>\n"

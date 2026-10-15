@@ -51,12 +51,17 @@ def init_db() -> None:
                 is_deleted INTEGER NOT NULL DEFAULT 0,
                 deleted_at TEXT,
                 local_path TEXT,
+                is_timed INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(chat_id, message_id)
             )
             """
         )
         try:
             cursor.execute("ALTER TABLE messages ADD COLUMN local_path TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN is_timed INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
 
@@ -184,6 +189,7 @@ def save_message(
     caption: Optional[str],
     created_at: str,
     local_path: Optional[str] = None,
+    is_timed: bool = False,
 ) -> None:
     """Save a business chat message to the local cache."""
     with get_db_connection() as conn:
@@ -192,8 +198,8 @@ def save_message(
             INSERT OR REPLACE INTO messages (
                 business_connection_id, chat_id, message_id,
                 sender_id, sender_name, sender_username,
-                text, media_type, media_file_id, caption, created_at, is_deleted, local_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                text, media_type, media_file_id, caption, created_at, is_deleted, local_path, is_timed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 business_connection_id,
@@ -208,6 +214,7 @@ def save_message(
                 caption,
                 created_at,
                 local_path,
+                1 if is_timed else 0,
             ),
         )
         conn.commit()
@@ -302,6 +309,9 @@ def get_stats() -> Dict[str, int]:
         cursor.execute("SELECT COUNT(*) FROM business_connections WHERE is_enabled = 1")
         active_connections = cursor.fetchone()[0]
 
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE is_timed = 1")
+        total_timed = cursor.fetchone()[0]
+
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
 
@@ -312,6 +322,7 @@ def get_stats() -> Dict[str, int]:
             "total_messages": total_messages,
             "total_deleted": total_deleted,
             "total_edits": total_edits,
+            "total_timed": total_timed,
             "active_connections": active_connections,
             "total_users": total_users,
             "total_blocked": total_blocked,
@@ -319,7 +330,7 @@ def get_stats() -> Dict[str, int]:
 
 
 def get_recent_deletions(limit: int = 6, filter_type: str = "all") -> List[Dict[str, Any]]:
-    """Retrieve recently deleted messages with optional filter ('all', 'media', 'text')."""
+    """Retrieve recently deleted messages with optional filter ('all', 'media', 'timed', 'text')."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if filter_type == "media":
@@ -327,6 +338,16 @@ def get_recent_deletions(limit: int = 6, filter_type: str = "all") -> List[Dict[
                 """
                 SELECT * FROM messages
                 WHERE is_deleted = 1 AND media_type IS NOT NULL AND media_type != ''
+                ORDER BY deleted_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        elif filter_type == "timed":
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                WHERE is_deleted = 1 AND is_timed = 1
                 ORDER BY deleted_at DESC
                 LIMIT ?
                 """,
@@ -356,7 +377,7 @@ def get_recent_deletions(limit: int = 6, filter_type: str = "all") -> List[Dict[
 
 
 def get_recent_messages(limit: int = 6, filter_type: str = "all") -> List[Dict[str, Any]]:
-    """Retrieve most recently cached messages across all chats with optional filter ('all', 'media', 'text')."""
+    """Retrieve most recently cached messages across all chats with optional filter ('all', 'media', 'timed', 'text')."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if filter_type == "media":
@@ -364,6 +385,16 @@ def get_recent_messages(limit: int = 6, filter_type: str = "all") -> List[Dict[s
                 """
                 SELECT * FROM messages
                 WHERE media_type IS NOT NULL AND media_type != ''
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        elif filter_type == "timed":
+            cursor.execute(
+                """
+                SELECT * FROM messages
+                WHERE is_timed = 1
                 ORDER BY id DESC
                 LIMIT ?
                 """,
