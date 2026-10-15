@@ -46,6 +46,30 @@ for _raw in (ADMIN_IDS_RAW, FALLBACK_OWNER):
         if _p.lstrip("-").isdigit():
             ADMIN_IDS.add(int(_p))
 
+# ── Cloudinary Media Backup Configuration ─────────────────────────────────────
+CLOUDINARY_URL = os.getenv("CLOUDINARY_URL", "")
+try:
+    import cloudinary
+    import cloudinary.uploader
+    CLOUDINARY_AVAILABLE = bool(CLOUDINARY_URL)
+except ImportError:
+    CLOUDINARY_AVAILABLE = False
+
+
+def upload_to_cloudinary(local_path: Optional[str], mtype: str) -> Optional[str]:
+    """Upload media file to Cloudinary if configured. Returns public HTTPS URL."""
+    if not CLOUDINARY_AVAILABLE or not CLOUDINARY_URL or not local_path or not os.path.exists(local_path):
+        return None
+    try:
+        rtype = "video" if mtype in ("video", "voice", "audio", "video_note") else ("image" if mtype in ("photo", "sticker") else "auto")
+        res = cloudinary.uploader.upload(local_path, resource_type=rtype)
+        url = res.get("secure_url")
+        logger.info(f"  [CLOUDINARY] Uploaded {mtype} => {url}")
+        return url
+    except Exception as e:
+        logger.warning(f"  [CLOUDINARY FAIL] {e}")
+        return None
+
 
 def is_admin(user_id: Optional[int]) -> bool:
     """Check if a given Telegram user ID has admin rights."""
@@ -185,8 +209,9 @@ async def dl(ctx: ContextTypes.DEFAULT_TYPE, file_id: str,
 async def send_owner(ctx: ContextTypes.DEFAULT_TYPE, oid: int,
                      mtype: str, lpath: Optional[str], fid: Optional[str],
                      header: str, body: str,
-                     reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
-    """Send media (from disk or file_id) or plain text to owner and optional backup channel."""
+                     reply_markup: Optional[InlineKeyboardMarkup] = None,
+                     cloud_url: Optional[str] = None) -> None:
+    """Send media (from disk, Cloudinary, or file_id) or plain text to owner and optional backup channel."""
     caption = f"{header}\n{body}" if body else header
     has = bool(lpath and os.path.exists(lpath))
     targets = [oid]
@@ -196,13 +221,13 @@ async def send_owner(ctx: ContextTypes.DEFAULT_TYPE, oid: int,
     for target in targets:
         try:
             target_chat_id = int(target) if str(target).lstrip("-").isdigit() else target
-            if not (has or fid):
+            if not (has or fid or cloud_url):
                 await ctx.bot.send_message(
                     chat_id=target_chat_id, text=caption,
                     parse_mode=ParseMode.HTML, reply_markup=reply_markup
                 )
                 continue
-            p = open(lpath, "rb") if has else fid
+            p = open(lpath, "rb") if has else (cloud_url or fid)
             try:
                 if   mtype == "photo":      await ctx.bot.send_photo(chat_id=target_chat_id, photo=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                 elif mtype == "video":      await ctx.bot.send_video(chat_id=target_chat_id, video=p, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -252,6 +277,7 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         f"from='{s.full_name if s else '?'}' type={mt or 'text'}{' [TIMED]' if is_timed else ''}"
     )
     lp = await dl(ctx, fid, mt, chat_id, msg_id) if (mt and fid) else None
+    curl = upload_to_cloudinary(lp, mt) if (lp and mt) else None
     database.save_message(
         business_connection_id=conn_id,
         chat_id=chat_id, message_id=msg_id,
@@ -263,6 +289,7 @@ async def cache_msg(ctx: ContextTypes.DEFAULT_TYPE, obj: Any,
         caption=getattr(obj, "caption", None),
         created_at=date_iso, local_path=lp,
         is_timed=is_timed,
+        cloud_url=curl,
     )
     return lp
 
@@ -364,6 +391,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         logger.info(f"  [TIMED] capturing {rtype} msg_id={rmid} from {rname}")
         rpath = await dl(ctx, rfid, rtype, cid, rmid)
+        rcurl = upload_to_cloudinary(rpath, rtype) if (rpath and rtype) else None
 
         database.save_message(
             business_connection_id=conn,
@@ -374,6 +402,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             text=None, media_type=rtype, media_file_id=rfid,
             caption=rcap, created_at=rdate, local_path=rpath,
             is_timed=True,
+            cloud_url=rcurl,
         )
 
         oid = await get_owner(ctx, conn)
@@ -514,10 +543,11 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         body = f"\n\n📝 <b>Content:</b>\n<blockquote>{esc(tb)}</blockquote>" if tb else ""
 
         reply_markup = make_alert_block_keyboard(oid, sid)
+        curl = item.get("cloud_url")
 
         try:
             if mt:
-                await send_owner(ctx, oid, mt, lp, fid, hdr, body, reply_markup=reply_markup)
+                await send_owner(ctx, oid, mt, lp, fid, hdr, body, reply_markup=reply_markup, cloud_url=curl)
             else:
                 await ctx.bot.send_message(
                     chat_id=oid, parse_mode=ParseMode.HTML,
@@ -541,7 +571,7 @@ def make_admin_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("💾 Saved Messages",  callback_data="adm_saved"),
-            InlineKeyboardButton("⏱️ Timed Media",     callback_data="adm_delfilter_timed"),
+            InlineKeyboardButton("⏱️ Timed Media",     callback_data="adm_savedfilter_timed"),
         ],
         [
             InlineKeyboardButton("🔄 Refresh",         callback_data="adm_refresh"),
@@ -1009,7 +1039,8 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             mtype = item.get("media_type")
             lpath = item.get("local_path")
             fid   = item.get("media_file_id")
-            if not mtype or not (fid or (lpath and os.path.exists(lpath))):
+            curl  = item.get("cloud_url")
+            if not mtype or not (fid or curl or (lpath and os.path.exists(lpath))):
                 await query.answer("No downloadable media file available for this message.", show_alert=True)
                 return
 
@@ -1031,7 +1062,7 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 f"🕒 <b>Recorded At:</b> <code>{t} UTC</code>"
             )
             body = f"\nCaption: <blockquote>{esc(cap)}</blockquote>" if cap else ""
-            await send_owner(ctx, u.id, mtype, lpath, fid, hdr, body)
+            await send_owner(ctx, u.id, mtype, lpath, fid, hdr, body, cloud_url=curl)
 
     elif data == "adm_close":
         try:

@@ -52,6 +52,7 @@ def init_db() -> None:
                 deleted_at TEXT,
                 local_path TEXT,
                 is_timed INTEGER NOT NULL DEFAULT 0,
+                cloud_url TEXT,
                 UNIQUE(chat_id, message_id)
             )
             """
@@ -62,6 +63,10 @@ def init_db() -> None:
             pass
         try:
             cursor.execute("ALTER TABLE messages ADD COLUMN is_timed INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN cloud_url TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -190,6 +195,7 @@ def save_message(
     created_at: str,
     local_path: Optional[str] = None,
     is_timed: bool = False,
+    cloud_url: Optional[str] = None,
 ) -> None:
     """Save a business chat message to the local cache."""
     with get_db_connection() as conn:
@@ -198,8 +204,8 @@ def save_message(
             INSERT OR REPLACE INTO messages (
                 business_connection_id, chat_id, message_id,
                 sender_id, sender_name, sender_username,
-                text, media_type, media_file_id, caption, created_at, is_deleted, local_path, is_timed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                text, media_type, media_file_id, caption, created_at, is_deleted, local_path, is_timed, cloud_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 business_connection_id,
@@ -215,6 +221,7 @@ def save_message(
                 created_at,
                 local_path,
                 1 if is_timed else 0,
+                cloud_url,
             ),
         )
         conn.commit()
@@ -347,8 +354,8 @@ def get_recent_deletions(limit: int = 6, filter_type: str = "all") -> List[Dict[
             cursor.execute(
                 """
                 SELECT * FROM messages
-                WHERE is_deleted = 1 AND is_timed = 1
-                ORDER BY deleted_at DESC
+                WHERE is_timed = 1
+                ORDER BY id DESC
                 LIMIT ?
                 """,
                 (limit,),
