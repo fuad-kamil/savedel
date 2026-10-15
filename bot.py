@@ -963,6 +963,82 @@ def render_saved_view(filter_type: str = "all") -> tuple[str, InlineKeyboardMark
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
+def render_user_vault_view(user_id: int, page: int = 1, filter_type: str = "all") -> tuple[str, InlineKeyboardMarkup]:
+    """Render conversation messages for a user (both their messages and receiver replies)."""
+    items, total_count, total_pages = database.get_user_conversation_messages(
+        user_id=user_id, page=page, per_page=5, filter_type=filter_type
+    )
+    page = min(max(1, page), total_pages)
+
+    if filter_type == "media":
+        type_label = "📸 Media Only"
+    elif filter_type == "timed":
+        type_label = "⏱️ Timed Media Only"
+    elif filter_type == "text":
+        type_label = "💬 Text Only"
+    else:
+        type_label = "All Messages"
+
+    lines = [
+        f"💾 <b>My Saved Messages</b> ({type_label})\n"
+        f"<i>Your messages & receiver replies (Page {page}/{total_pages} - Total: {total_count})</i>\n"
+    ]
+    if not items:
+        lines.append("<i>No conversation messages found in this category.</i>")
+
+    media_buttons = []
+    for i, it in enumerate(items, 1):
+        sid = it.get("sender_id")
+        is_me = (sid == user_id)
+        sn = "You" if is_me else esc(it.get("sender_name") or "Receiver")
+        prefix = "📤 <b>You:</b>" if is_me else f"📥 <b>{sn}:</b>"
+
+        mtype = it.get("media_type")
+        is_timed = bool(it.get("is_timed"))
+        db_id = it.get("id")
+
+        cap = it.get("caption") or it.get("text") or ""
+        if cap and len(cap) > 36:
+            cap = cap[:33] + "..."
+
+        t = (it.get("created_at") or "")[:19].replace("T", " ")
+
+        if mtype:
+            mbadge = format_media_badge(mtype)
+            if is_timed:
+                mbadge = f"⏱️ Timed {mbadge}"
+            content_desc = f"{mbadge}" + (f': <i>"{esc(cap)}"</i>' if cap else "")
+            media_buttons.append(InlineKeyboardButton(f"📥 View #{i} ({mtype})", callback_data=f"usr_getmedia_{db_id}"))
+        else:
+            content_desc = f'<i>"{esc(cap or "[Empty]")}"</i>'
+
+        lines.append(f"<b>{i}.</b> {prefix} {content_desc}\n   🕒 <code>{t} UTC</code>\n")
+
+    keyboard = []
+    for j in range(0, len(media_buttons), 2):
+        keyboard.append(media_buttons[j:j+2])
+
+    filter_row = [
+        InlineKeyboardButton("• All •" if filter_type == "all" else "All", callback_data=f"usr_savedfilter_all_{page}"),
+        InlineKeyboardButton("• 📸 Media •" if filter_type == "media" else "📸 Media", callback_data=f"usr_savedfilter_media_{page}"),
+        InlineKeyboardButton("• ⏱️ Timed •" if filter_type == "timed" else "⏱️ Timed", callback_data=f"usr_savedfilter_timed_{page}"),
+        InlineKeyboardButton("• 💬 Text •" if filter_type == "text" else "💬 Text", callback_data=f"usr_savedfilter_text_{page}"),
+    ]
+    keyboard.append(filter_row)
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"usr_saved_{page - 1}_{filter_type}"))
+    nav_row.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="adm_noop"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"usr_saved_{page + 1}_{filter_type}"))
+
+    if nav_row:
+        keyboard.append(nav_row)
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
@@ -976,7 +1052,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"👋 Welcome, <b>{fname}</b>!\n\n"
             f"Glad to have you here. Have a great day!"
         )
-        await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💾 My Saved Messages", callback_data="usr_saved_1_all")
+        ]])
+        await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     c = database.get_active_connection_by_user(u.id)
@@ -1134,11 +1213,12 @@ async def cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
-    if not u or not is_admin(u.id):
-        fname = esc(u.first_name or u.full_name or "there") if u else "there"
-        await update.message.reply_text(f"👋 Welcome, <b>{fname}</b>!\n\nGlad to have you here. Have a great day!", parse_mode=ParseMode.HTML)
+    if not u:
         return
-    text, kb = render_saved_view("all")
+    if is_admin(u.id):
+        text, kb = render_saved_view("all")
+    else:
+        text, kb = render_user_vault_view(u.id, page=1, filter_type="all")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
@@ -1154,6 +1234,68 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     if data == "adm_noop":
         return
+
+    # Regular user vault callbacks (available to all users)
+    if data.startswith("usr_saved_"):
+        parts = data.split("_")
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        ftype = parts[3] if len(parts) > 3 else "all"
+        text, kb = render_user_vault_view(u.id, page=page, filter_type=ftype)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if data.startswith("usr_savedfilter_"):
+        parts = data.split("_")
+        ftype = parts[2] if len(parts) > 2 else "all"
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+        text, kb = render_user_vault_view(u.id, page=page, filter_type=ftype)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if data.startswith("usr_getmedia_"):
+        target_str = data.replace("usr_getmedia_", "")
+        if target_str.isdigit():
+            db_id = int(target_str)
+            item = database.get_message_by_db_id(db_id)
+            if not item:
+                await query.answer("Message not found in database.", show_alert=True)
+                return
+
+            # Privacy Check: User can only access their own conversation or admin can access all
+            if not (item.get("chat_id") == u.id or item.get("sender_id") == u.id or is_admin(u.id)):
+                await query.answer("⛔ Access denied: You do not own this media.", show_alert=True)
+                return
+
+            mtype = item.get("media_type")
+            lpath = item.get("local_path")
+            fid   = item.get("media_file_id")
+            curl  = item.get("cloud_url")
+            if not mtype or not (fid or curl or (lpath and os.path.exists(lpath))):
+                await query.answer("No downloadable media file available for this message.", show_alert=True)
+                return
+
+            await query.answer(f"Sending {mtype}... 🚀")
+            is_me = (item.get("sender_id") == u.id)
+            sn  = "You" if is_me else esc(item.get("sender_name") or "Receiver")
+            t   = (item.get("created_at") or "")[:19].replace("T", " ")
+            cap = item.get("caption") or item.get("text") or ""
+            mbadge = format_media_badge(mtype)
+
+            hdr = (
+                f"💾 <b>Saved Media</b>\n\n"
+                f"👤 <b>From:</b> {sn}\n"
+                f"📦 <b>Type:</b> {mbadge}\n"
+                f"🕒 <b>Recorded At:</b> <code>{t} UTC</code>"
+            )
+            body = f"\nCaption: <blockquote>{esc(cap)}</blockquote>" if cap else ""
+            await send_owner(ctx, u.id, mtype, lpath, fid, hdr, body, cloud_url=curl)
+            return
 
     # User start shortcut buttons
     if data in ("cmd_status_btn", "cmd_saved_btn"):
@@ -1390,12 +1532,19 @@ async def on_direct_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             f"✅ <b>File Saved!</b>\n\n"
             f"Type: <code>{mt}</code>\n"
             f"Saved: <code>{fname}</code>\n"
-            f"Cached in database and stored on disk.",
+            f"Cached in database and cloud storage.\n"
+            f"View all your messages & replies anytime with /saved.",
             parse_mode=ParseMode.HTML,
         )
     elif mt and not lp:
         await msg.reply_text(
             f"⚠️ <b>Logged</b>, but media download failed (could be restricted/too large).",
+            parse_mode=ParseMode.HTML,
+        )
+    elif msg.text:
+        await msg.reply_text(
+            "✅ <b>Message Saved!</b>\n\n"
+            "View all your messages & replies anytime with /saved.",
             parse_mode=ParseMode.HTML,
         )
 

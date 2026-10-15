@@ -455,6 +455,52 @@ def get_recent_messages(limit: int = 6, filter_type: str = "all") -> List[Dict[s
         return [dict(r) for r in cursor.fetchall()]
 
 
+def get_user_conversation_messages(
+    user_id: int,
+    page: int = 1,
+    per_page: int = 5,
+    filter_type: str = "all",
+) -> tuple[List[Dict[str, Any]], int, int]:
+    """
+    Retrieve conversation messages for a specific user (both what they sent and what the receiver replied).
+    Returns (items, total_count, total_pages).
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        where_clauses = ["(chat_id = ? OR sender_id = ?)"]
+        params: list[Any] = [user_id, user_id]
+
+        if filter_type == "media":
+            where_clauses.append("(media_type IS NOT NULL AND media_type != '')")
+        elif filter_type == "timed":
+            where_clauses.append("is_timed = 1")
+        elif filter_type == "text":
+            where_clauses.append("(media_type IS NULL OR media_type = '')")
+
+        where_sql = " AND ".join(where_clauses)
+
+        cursor.execute(f"SELECT COUNT(*) FROM messages WHERE {where_sql}", tuple(params))
+        total_count = cursor.fetchone()[0]
+
+        total_pages = max(1, (total_count + per_page - 1) // per_page)
+        page = min(max(1, page), total_pages)
+        offset = (page - 1) * per_page
+
+        query_params = list(params) + [per_page, offset]
+        cursor.execute(
+            f"""
+            SELECT * FROM messages
+            WHERE {where_sql}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(query_params),
+        )
+        items = [dict(r) for r in cursor.fetchall()]
+        return items, total_count, total_pages
+
+
 def get_message_by_db_id(db_id: int) -> Optional[Dict[str, Any]]:
     """Retrieve a cached message by its primary key ID."""
     with get_db_connection() as conn:
