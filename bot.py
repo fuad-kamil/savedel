@@ -169,25 +169,41 @@ async def bg_upload_to_cloudinary(local_path: Optional[str], mtype: str, chat_id
 
 
 def is_admin(user_id: Optional[int]) -> bool:
-    """Check if a given Telegram user ID has admin rights."""
+    """Check if a given Telegram user ID has admin rights. Strictly restricted to configured admins/owners."""
     if not user_id:
         return False
+    # 1. Explicitly configured in ADMIN_IDS or OWNER_ID
     if user_id in ADMIN_IDS:
         return True
     try:
-        if FALLBACK_OWNER and int(FALLBACK_OWNER) == user_id:
-            return True
+        if FALLBACK_OWNER and str(FALLBACK_OWNER).strip().lstrip("-").isdigit():
+            if int(FALLBACK_OWNER) == user_id:
+                return True
     except (ValueError, TypeError):
         pass
-    # Check if marked admin in users DB
+
+    # If admin IDs are configured in environment, strictly enforce: NO ONE ELSE is admin
+    if ADMIN_IDS or (FALLBACK_OWNER and str(FALLBACK_OWNER).strip().lstrip("-").isdigit()):
+        return False
+
+    # 2. Explicitly marked as admin in database
     try:
         if user_id in database.get_admin_user_ids():
             return True
     except Exception:
         pass
-    # Owners of an active Telegram Business connection are automatically admins
-    conn = database.get_active_connection_by_user(user_id)
-    return bool(conn)
+
+    # 3. Only if NO admin was ever configured in environment or DB, fall back strictly to the primary (earliest) connection owner
+    try:
+        conns = database.get_active_connections()
+        if conns:
+            first_uid = conns[0].get("user_chat_id") or conns[0].get("user_id")
+            if first_uid and int(first_uid) == user_id:
+                return True
+    except Exception:
+        pass
+
+    return False
 
 
 def get_reply_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
@@ -220,25 +236,27 @@ def is_duplicate_alert(alert_key: str, cooldown_seconds: float = 4.0) -> bool:
 
 
 def get_admin_notification_targets() -> set[int]:
-    """Retrieve unique admin and active business owner IDs to receive operational notifications."""
+    """Retrieve unique admin and owner IDs to receive operational notifications."""
     targets: set[int] = set()
     for aid in ADMIN_IDS:
         targets.add(int(aid))
-    if FALLBACK_OWNER and str(FALLBACK_OWNER).lstrip("-").isdigit():
+    if FALLBACK_OWNER and str(FALLBACK_OWNER).strip().lstrip("-").isdigit():
         targets.add(int(FALLBACK_OWNER))
     try:
         for uid in database.get_admin_user_ids():
             targets.add(int(uid))
     except Exception:
         pass
-    # Business connection owners are primary bot administrators and must always receive alerts
-    try:
-        for conn in database.get_active_connections():
-            uid = conn.get("user_chat_id") or conn.get("user_id")
-            if uid:
-                targets.add(int(uid))
-    except Exception:
-        pass
+    # If no explicit admin configured in environment, fall back strictly to the primary owner
+    if not targets:
+        try:
+            conns = database.get_active_connections()
+            if conns:
+                first_uid = conns[0].get("user_chat_id") or conns[0].get("user_id")
+                if first_uid:
+                    targets.add(int(first_uid))
+        except Exception:
+            pass
     return targets
 
 
@@ -331,6 +349,18 @@ async def set_admin_commands_for(bot: Any, admin_id: int) -> None:
         logger.info(f"[CMD SCOPE] Admin commands applied to user_id={admin_id}")
     except Exception as e:
         logger.warning(f"[CMD SCOPE FAIL] user_id={admin_id}: {e}")
+
+
+async def set_user_commands_for(bot: Any, user_id: int) -> None:
+    """Ensure a non-admin user chat only shows regular user commands (/start, /saved)."""
+    try:
+        await bot.set_my_commands(
+            _USER_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=user_id),
+        )
+        logger.info(f"[CMD SCOPE] User commands enforced for user_id={user_id}")
+    except Exception as e:
+        logger.debug(f"[CMD SCOPE] user_id={user_id}: {e}")
 
 
 
@@ -1227,6 +1257,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     database.record_user(u.id, u.full_name or "Unknown", u.username, is_admin=admin_flag)
 
     if not admin_flag:
+        # Enforce restricted user menu commands on their Telegram client
+        await set_user_commands_for(ctx.bot, u.id)
         fname = esc(u.first_name or u.full_name or "there")
         welcome_text = (
             f"👋 Welcome, <b>{fname}</b>!\n\n"
@@ -1285,8 +1317,7 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
-        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
-        return
+        return  # Silently ignore — do not answer admin commands for non-admins
     text, kb = render_users_view(1)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -1294,8 +1325,7 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_block(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
-        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
-        return
+        return  # Silently ignore — do not answer admin commands for non-admins
     if not ctx.args or not ctx.args[0].isdigit():
         await update.message.reply_text("Usage: <code>/block &lt;user_id&gt;</code>\nExample: <code>/block 123456789</code>", parse_mode=ParseMode.HTML)
         return
@@ -1310,8 +1340,7 @@ async def cmd_block(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
-        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
-        return
+        return  # Silently ignore — do not answer admin commands for non-admins
     if not ctx.args or not ctx.args[0].isdigit():
         await update.message.reply_text("Usage: <code>/unblock &lt;user_id&gt;</code>\nExample: <code>/unblock 123456789</code>", parse_mode=ParseMode.HTML)
         return
@@ -1326,11 +1355,11 @@ async def cmd_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_purge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
-        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin only.", parse_mode=ParseMode.HTML)
-        return
+        return  # Silently ignore — do not answer admin commands for non-admins
     if not ctx.args or not ctx.args[0].isdigit():
         await update.message.reply_text("Usage: <code>/purge &lt;db_id&gt;</code>\nExample: <code>/purge 12</code>", parse_mode=ParseMode.HTML)
         return
+
     db_id = int(ctx.args[0])
     item = database.get_message_by_db_id(db_id)
     if not item:
@@ -1484,7 +1513,7 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     # User start shortcut buttons
     if data in ("cmd_status_btn", "cmd_saved_btn"):
         if not is_admin(u.id):
-            await query.answer("⛔ Access denied: Admin only.", show_alert=True)
+            await query.answer()
             return
         if data == "cmd_status_btn":
             s = database.get_stats()
@@ -1504,7 +1533,7 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     # Admin verification for all administrative actions
     if not is_admin(u.id):
-        await query.answer("⛔ Access denied: You are not an admin.", show_alert=True)
+        await query.answer()
         return
 
     if data in ("adm_menu", "adm_refresh"):
