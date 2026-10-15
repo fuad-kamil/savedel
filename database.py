@@ -156,12 +156,16 @@ def get_connection(connection_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_active_connection_by_user(user_id: int) -> Optional[Dict[str, Any]]:
-    """Retrieve active connection for a given user ID."""
+    """Retrieve active connection for a given user ID or user_chat_id."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM business_connections WHERE user_id = ? AND is_enabled = 1 ORDER BY updated_at DESC LIMIT 1",
-            (user_id,),
+            """
+            SELECT * FROM business_connections 
+            WHERE (user_id = ? OR user_chat_id = ?) AND is_enabled = 1 
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (user_id, user_id),
         )
         row = cursor.fetchone()
         return dict(row) if row else None

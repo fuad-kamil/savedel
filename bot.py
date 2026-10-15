@@ -53,9 +53,28 @@ def is_admin(user_id: Optional[int]) -> bool:
         return False
     if user_id in ADMIN_IDS:
         return True
+    try:
+        if FALLBACK_OWNER and int(FALLBACK_OWNER) == user_id:
+            return True
+    except (ValueError, TypeError):
+        pass
     # Owners of an active Telegram Business connection are automatically admins
     conn = database.get_active_connection_by_user(user_id)
     return bool(conn)
+
+
+def make_alert_block_keyboard(owner_id: Optional[int], sender_id: Any) -> Optional[InlineKeyboardMarkup]:
+    """
+    Generate an inline keyboard for saved/alert messages.
+    Non-admin users will NEVER see administrative buttons like 'Block User'.
+    """
+    if not is_admin(owner_id):
+        return None
+    if not sender_id or not str(sender_id).isdigit():
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚫 Block User", callback_data=f"block_usr_{sender_id}")
+    ]])
 
 
 # ── Render Health Server ───────────────────────────────────────────────────────
@@ -359,9 +378,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cname = msg.chat.title or msg.chat.first_name or str(cid)
         rsid = rs.id if rs else "Unknown"
         runame = f"@{rs.username}" if (rs and rs.username) else "None"
-        reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"🚫 Block User ({rsid})", callback_data=f"block_usr_{rsid}")
-        ]]) if str(rsid).isdigit() else None
+        reply_markup = make_alert_block_keyboard(oid, rsid)
 
         if rpath and os.path.exists(rpath):
             header = (
@@ -411,9 +428,7 @@ async def on_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cn   = msg.chat.title or msg.chat.first_name or str(cid)
     old  = (old_d.get("text") or old_d.get("caption") or "[not cached]") if old_d else "[not cached]"
 
-    reply_markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"🚫 Block User ({sid})", callback_data=f"block_usr_{sid}")
-    ]]) if str(sid).isdigit() else None
+    reply_markup = make_alert_block_keyboard(oid, sid)
 
     try:
         await ctx.bot.send_message(
@@ -488,9 +503,7 @@ async def on_deleted(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         body = f"\n\n📝 <b>Content:</b>\n<blockquote>{esc(tb)}</blockquote>" if tb else ""
 
-        reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"🚫 Block User ({sid})", callback_data=f"block_usr_{sid}")
-        ]]) if str(sid).isdigit() else None
+        reply_markup = make_alert_block_keyboard(oid, sid)
 
         try:
             if mt:
@@ -815,11 +828,22 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             target_id = int(target_str)
             database.block_user(target_id)
             await query.answer(f"User {target_id} blocked! 🚫", show_alert=True)
-            text, kb = render_users_view(1)
-            try:
-                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-            except Exception:
-                pass
+            msg_text = query.message.text or query.message.caption or ""
+            if "User Directory" in msg_text:
+                text, kb = render_users_view(1)
+                try:
+                    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(f"✅ User Blocked ({target_id})", callback_data="adm_noop")
+                        ]])
+                    )
+                except Exception:
+                    pass
 
     elif data.startswith("unblock_usr_"):
         target_str = data.replace("unblock_usr_", "")
