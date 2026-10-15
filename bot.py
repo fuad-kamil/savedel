@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, BotCommand, MenuButtonCommands,
+    BotCommandScopeChat, BotCommandScopeDefault,
 )
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
@@ -269,20 +270,59 @@ async def notify_admins(
             logger.warning(f"[ADMIN NOTIFY FAIL] to={tid}: {e}")
 
 
+# Commands visible to all regular (non-admin) users
+_USER_COMMANDS = [
+    BotCommand("start", "🚀 Start / Main Menu"),
+    BotCommand("saved", "💾 My Saved Messages"),
+]
+
+# Full command set visible only to administrators
+_ADMIN_COMMANDS = [
+    BotCommand("start", "🚀 Start / Main Menu"),
+    BotCommand("saved", "💾 My Saved Messages"),
+    BotCommand("status", "📊 System Status"),
+    BotCommand("admin", "👑 Admin Dashboard"),
+]
+
+
 async def post_init(application: Any) -> None:
-    """Register persistent Telegram commands and chat menu button."""
+    """Register persistent Telegram commands scoped per user role, and set chat menu button."""
     try:
-        commands = [
-            BotCommand("start", "🚀 Start / Main Menu"),
-            BotCommand("saved", "💾 My Saved Messages"),
-            BotCommand("status", "📊 System Status"),
-            BotCommand("admin", "👑 Admin Dashboard"),
-        ]
-        await application.bot.set_my_commands(commands)
+        # 1. Set default commands for all users (non-admin): only /start and /saved
+        await application.bot.set_my_commands(
+            _USER_COMMANDS,
+            scope=BotCommandScopeDefault(),
+        )
+
+        # 2. Override commands for each known admin with the full admin command set
+        admin_ids = get_admin_notification_targets()
+        for admin_id in admin_ids:
+            try:
+                await application.bot.set_my_commands(
+                    _ADMIN_COMMANDS,
+                    scope=BotCommandScopeChat(chat_id=admin_id),
+                )
+                logger.info(f"[INIT] Set admin commands for user_id={admin_id}")
+            except Exception as e_scope:
+                logger.warning(f"[INIT] Could not scope commands for admin {admin_id}: {e_scope}")
+
+        # 3. Set native Telegram Chat Menu button (the blue button next to text input)
         await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        logger.info("[INIT] Registered bot commands and persistent Chat Menu button")
+        logger.info(f"[INIT] Registered commands (default={len(_USER_COMMANDS)}, admins={len(admin_ids)}) and Chat Menu button")
     except Exception as e:
         logger.warning(f"[INIT] Could not set bot menu commands: {e}")
+
+
+async def set_admin_commands_for(bot: Any, admin_id: int) -> None:
+    """Promote a specific user ID to show the full admin command set."""
+    try:
+        await bot.set_my_commands(
+            _ADMIN_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=admin_id),
+        )
+        logger.info(f"[CMD SCOPE] Admin commands applied to user_id={admin_id}")
+    except Exception as e:
+        logger.warning(f"[CMD SCOPE FAIL] user_id={admin_id}: {e}")
 
 
 
@@ -1205,13 +1245,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=get_reply_keyboard(admin=True),
     )
     await update.message.reply_text(parse_mode=ParseMode.HTML, text=text, reply_markup=InlineKeyboardMarkup(kb))
+    # Ensure this admin's chat always shows the full admin command set
+    await set_admin_commands_for(ctx.bot, u.id)
 
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
-        await update.message.reply_text("⛔ <b>Access Denied:</b> Admin panel is restricted to administrators.", parse_mode=ParseMode.HTML)
-        return
+        return  # Silently ignore — non-admins cannot access admin panel
     text = make_admin_dashboard_text(u)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=make_admin_menu_keyboard())
 
@@ -1306,8 +1347,7 @@ async def cmd_purge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
-        fname = esc(u.first_name or u.full_name or "there") if u else "there"
-        await update.message.reply_text(f"👋 Welcome, <b>{fname}</b>!\n\nGlad to have you here. Have a great day!", parse_mode=ParseMode.HTML)
+        # Silently ignore — not a command non-admins should see
         return
     c = database.get_active_connection_by_user(u.id) if u else None
     s = database.get_stats()
@@ -1325,9 +1365,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
-        fname = esc(u.first_name or u.full_name or "there") if u else "there"
-        await update.message.reply_text(f"👋 Welcome, <b>{fname}</b>!\n\nGlad to have you here. Have a great day!", parse_mode=ParseMode.HTML)
-        return
+        return  # Silently ignore — non-admins should not see this
     text, kb = render_deletions_view("all")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
